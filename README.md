@@ -32,9 +32,10 @@ app.route('/webhooks', createWebhooks([orderPaid]))
   value is checked against the `response` schema.
 - **Any schema library.** Zod, Valibot, ArkType, Effect Schema, or anything
   else that implements Standard Schema. Async schemas work too.
-- **Raw body included.** `rawBody` is always passed next to the parsed body,
-  so you can verify signatures (Stripe, GitHub, Shopify, ...) without extra
-  setup.
+- **Signed webhooks built in.** `verify` checks the signature on the raw
+  body before anything is parsed, with ready-made verifiers and signers for
+  Stripe, GitHub, Shopify and any HMAC scheme. `rawBody` is always passed to
+  the handler too.
 - **Plain Hono.** `createWebhooks` returns a Hono app. Handlers get the Hono
   context `c`, Hono middleware works, `HTTPException` works, and it runs on
   every runtime Hono supports.
@@ -50,6 +51,7 @@ app.route('/webhooks', createWebhooks([orderPaid]))
 - [Handler input](#handler-input)
 - [Return values](#return-values)
 - [Body parsing](#body-parsing)
+- [Signature verification](#signature-verification)
 - [Mounting](#mounting)
 - [Typed env and middleware](#typed-env-and-middleware)
 - [Errors](#errors)
@@ -108,6 +110,7 @@ export const updateItem = defineWebhook(
 | `query`       | Standard Schema                                               | Validates the query string as `Record<string, string>`.                                                 |
 | `headers`     | Standard Schema                                               | Validates headers as `Record<string, string>` with **lower-case** names.                                |
 | `body`        | Standard Schema                                               | Validates the parsed body (see [Body parsing](#body-parsing)).                                          |
+| `verify`      | `({ c, rawBody, headers }) => boolean \| Promise<boolean>`     | Checks the signature before the body is parsed (see [Signature verification](#signature-verification)). |
 | `response`    | Standard Schema                                               | Types the handler's return value and checks it at runtime (see [Return values](#return-values)).        |
 | `bodyType`    | `'auto' \| 'json' \| 'form' \| 'text'`                        | How to parse the body. Default `'auto'`.                                                                |
 | `description` | `string`                                                      | Shown by `hono-webhooks list`.                                                                          |
@@ -169,6 +172,60 @@ The body is read once as text (`rawBody`), then parsed according to
 
 An empty body is `undefined` (the schema decides whether that's allowed).
 Malformed JSON is a `400` with `issues: [{ message: 'Malformed JSON' }]`.
+
+## Signature verification
+
+`verify` runs after the params, query and headers are validated but **before
+the body is parsed**, on the raw body. A request with a bad signature never
+reaches JSON parsing or the body schema, so signed webhooks can use `body`
+like any other webhook:
+
+```ts
+import { shopify } from 'hono-webhooks/signatures'
+
+export const orderCreated = defineWebhook(
+	{
+		method: 'POST',
+		path: '/shopify/orders',
+		verify: shopify.verify((c) => c.env.SHOPIFY_WEBHOOK_SECRET),
+		body: z.object({ id: z.number(), total_price: z.string() })
+	},
+	({ body }) => {
+		// only runs for correctly signed requests
+	}
+)
+```
+
+When `verify` returns `false`, the answer is
+`401 { error: 'Invalid signature', issues: [...] }` and `onEvent` gets
+`validation.target: 'signature'`.
+
+`hono-webhooks/signatures` has a verifier and a matching signer per provider:
+
+| Scheme                                  | Header                                  | Signed content      |
+| --------------------------------------- | --------------------------------------- | ------------------- |
+| `github`                                | `x-hub-signature-256: sha256=<hex>`     | body                |
+| `shopify`                               | `x-shopify-hmac-sha256: <base64>`       | body                |
+| `stripe`                                | `stripe-signature: t=<unix>,v1=<hex>`   | `<t>.<body>`        |
+| `hmac({ header, encoding, prefix?, hash? })` | any header, hex or base64, SHA-1/256/512 | body          |
+
+- `scheme.verify(secret)` gives a `verify` function. `secret` is a string or
+  `(c) => string | Promise<string>`, so it can come from `c.env`. An empty
+  secret throws (a 500), instead of silently accepting or rejecting everything.
+- `stripe.verify(secret, { toleranceSeconds })` also rejects timestamps more
+  than 300 seconds away by default, and accepts any matching `v1` so secret
+  rotation works.
+- `scheme.sign(rawBody, secret)` returns the headers the provider would send,
+  for tests and the CLI.
+- Signatures are compared with `crypto.subtle.verify`, which runs in constant
+  time. Everything uses Web Crypto, so it works on every runtime.
+
+For another provider, write the function yourself:
+
+```ts
+verify: async ({ c, rawBody, headers }) =>
+	headers['x-token'] === c.env.WEBHOOK_TOKEN
+```
 
 ## Mounting
 
@@ -309,72 +366,50 @@ Vercel Edge), and a rejection is logged instead of crashing the request.
 
 ## Recipes
 
-### Stripe signature verification
+### Stripe events
 
-`rawBody` is the exact payload Stripe signed.
+The body schema only runs on verified requests. `constructEventAsync` from
+the Stripe SDK works too, with `rawBody`, if you'd rather use their event
+types.
 
 ```ts
-import Stripe from 'stripe'
-import { HTTPException } from 'hono/http-exception'
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!)
+import { stripe } from 'hono-webhooks/signatures'
 
 export const stripeEvents = defineWebhook(
 	{
 		method: 'POST',
 		path: '/stripe',
-		headers: z.object({ 'stripe-signature': z.string() })
+		verify: stripe.verify(process.env.STRIPE_WEBHOOK_SECRET!),
+		body: z.object({
+			id: z.string(),
+			type: z.string(),
+			data: z.object({ object: z.record(z.string(), z.unknown()) })
+		})
 	},
-	async ({ headers, rawBody }) => {
-		let event: Stripe.Event
-		try {
-			event = await stripe.webhooks.constructEventAsync(
-				rawBody,
-				headers['stripe-signature'],
-				process.env.STRIPE_WEBHOOK_SECRET!
-			)
-		} catch {
-			throw new HTTPException(400, { message: 'Invalid signature' })
-		}
-		if (event.type === 'checkout.session.completed') {
-			await fulfil(event.data.object)
+	async ({ body }) => {
+		if (body.type === 'checkout.session.completed') {
+			await fulfil(body.data.object)
 		}
 		return { received: true }
 	}
 )
 ```
 
-### GitHub signature verification (Web Crypto, any runtime)
+### GitHub events
 
 ```ts
-async function hmacSha256Hex(secret: string, payload: string) {
-	const key = await crypto.subtle.importKey(
-		'raw',
-		new TextEncoder().encode(secret),
-		{ name: 'HMAC', hash: 'SHA-256' },
-		false,
-		['sign']
-	)
-	const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload))
-	return [...new Uint8Array(signature)].map((b) => b.toString(16).padStart(2, '0')).join('')
-}
+import { github } from 'hono-webhooks/signatures'
 
 export const githubPush = defineWebhook(
 	{
 		method: 'POST',
 		path: '/github',
-		headers: z.object({
-			'x-github-event': z.string(),
-			'x-hub-signature-256': z.string()
-		})
+		verify: github.verify((c) => c.env.GITHUB_WEBHOOK_SECRET),
+		headers: z.object({ 'x-github-event': z.string() }),
+		body: z.object({ ref: z.string().optional() })
 	},
-	async ({ c, headers, rawBody, body }) => {
-		const expected = `sha256=${await hmacSha256Hex(c.env.GITHUB_WEBHOOK_SECRET, rawBody)}`
-		// Use a constant-time compare in production, e.g. crypto.timingSafeEqual on Node.
-		if (expected !== headers['x-hub-signature-256']) {
-			throw new HTTPException(401, { message: 'Invalid signature' })
-		}
-		// body is the parsed JSON
+	({ headers, body }) => {
+		if (headers['x-github-event'] === 'push') deploy(body.ref)
 	}
 )
 ```
@@ -532,6 +567,13 @@ import {
 	WebhookValidationError // extends HTTPException; .target, .issues
 } from 'hono-webhooks'
 
+import {
+	github,
+	shopify,
+	stripe, // each: .verify(secret, options?) and .sign(rawBody, secret, options?)
+	hmac // (options) => a scheme like the ones above
+} from 'hono-webhooks/signatures'
+
 import type {
 	Webhook,
 	WebhookConfig,
@@ -540,6 +582,8 @@ import type {
 	WebhookEvent,
 	WebhooksOptions,
 	WebhooksApp,
+	Verify,
+	VerifyInput,
 	WebhookMethod,
 	BodyType,
 	ValidationTarget,
@@ -560,7 +604,7 @@ For code that used the in-app `lib/webhook` this package came from:
 | `reqBodySchema`, `reqQuerySchema`, ...         | `body`, `query`, `headers`, `params`, `response`                              |
 | `z.string()` body switches to text parsing     | Parsing follows `Content-Type`; set `bodyType: 'text'` to force it           |
 | `z.any()` body skips the content-type check    | No content-type check anymore; leave `body` out and read `body` / `rawBody`  |
-| `rawBody: true`                                | Always available as `rawBody`; the body is also parsed                        |
+| `rawBody: true` + checking the signature by hand | `verify: shopify.verify(secret)` (or your own function); `rawBody` is always passed too |
 | `request` in the handler                       | `c.req.raw`                                                                    |
 | `useHonoWebhooks(app)`                         | `app.route('/webhooks', createWebhooks(webhooks, { onEvent }))`               |
 | Built-in OTel span, logger, `recordWebhookCall` | `onEvent` (see [Recipes](#recipes)) and tracing middleware                    |

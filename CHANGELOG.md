@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.2.0...v0.3.0) (2026-09-28)
+
+
+### Features
+
+* svix signature scheme for Resend, Clerk and Standard Webhooks ([#12](https://github.com/HansKristoffer/hono-webhooks/issues/12)) ([dcc7a03](https://github.com/HansKristoffer/hono-webhooks/commit/dcc7a033947acfb2449cca5eb03161acbb1e16a6))
+
+
+### Bug Fixes
+
+* **cli:** rerun under Bun when Node can't load the module ([#13](https://github.com/HansKristoffer/hono-webhooks/issues/13)) ([693e88e](https://github.com/HansKristoffer/hono-webhooks/commit/693e88e4a9ba6c46ddcf1660dfb6860f075461d9))
+* run verify before validating params, query and headers ([#9](https://github.com/HansKristoffer/hono-webhooks/issues/9)) ([0446e4b](https://github.com/HansKristoffer/hono-webhooks/commit/0446e4b5787f6cbc874cb68e44f6aad932f83081))
+* summarizeEvent leaves error empty for validation failures ([#11](https://github.com/HansKristoffer/hono-webhooks/issues/11)) ([3a6b52f](https://github.com/HansKristoffer/hono-webhooks/commit/3a6b52f14d98cf204d475872dc9a1c4327e10a0c))
+
 ## [0.2.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.1.1...v0.2.0) (2026-09-28)
 
 

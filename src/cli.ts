@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -113,6 +114,32 @@ async function loadApp(path: string): Promise<WebhooksApp> {
 	)
 }
 
+/** Errors Node gives for TypeScript it can't load but Bun can. */
+const BUN_ONLY_ERRORS = new Set([
+	'ERR_MODULE_NOT_FOUND',
+	'ERR_UNKNOWN_FILE_EXTENSION',
+	'ERR_UNSUPPORTED_DIR_IMPORT',
+	'ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX',
+	'ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING'
+])
+
+/**
+ * Under Node, a Bun project's TypeScript (extensionless imports, for one)
+ * fails to load. Rerun the same command under Bun when it is installed.
+ */
+function rerunUnderBun(error: unknown): never {
+	const code = (error as { code?: string }).code
+	if (process.versions.bun || !code || !BUN_ONLY_ERRORS.has(code)) throw error
+	console.error(`Node can't load the module (${code}), trying Bun`)
+	const run = spawnSync('bun', process.argv.slice(1), { stdio: 'inherit' })
+	if (run.error) {
+		fail(
+			'Bun is not installed either. Run the CLI with a runtime that can load your code, e.g. bunx --bun hono-webhooks ...'
+		)
+	}
+	process.exit(run.status ?? 1)
+}
+
 async function signatureHeaders(rawBody: string) {
 	if (!values.sign) return {}
 	const scheme =
@@ -130,8 +157,13 @@ async function main() {
 		console.log(HELP)
 		return
 	}
-	for (const preload of values.preload ?? []) await importModule(preload)
-	const app = await loadApp(modulePath)
+	let app: WebhooksApp
+	try {
+		for (const preload of values.preload ?? []) await importModule(preload)
+		app = await loadApp(modulePath)
+	} catch (error) {
+		rerunUnderBun(error)
+	}
 
 	if (command === 'list') {
 		for (const { config } of app.webhooks) {

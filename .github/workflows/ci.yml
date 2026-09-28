@@ -37,3 +37,5 @@ jobs:
       - run: >-
           node dist/cli.js scripts/fixture-webhooks.ts test POST /orders/1 -b '{"total":1}'
           -r ./scripts/fixture-preload.ts --sign shopify --secret-env FIXTURE_SECRET
+      # Node can't load extensionless imports; the CLI must rerun under Bun.
+      - run: node dist/cli.js scripts/fixture-bun-only.ts test GET /health

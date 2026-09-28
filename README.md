@@ -60,6 +60,7 @@ app.route('/webhooks', createWebhooks([orderPaid]))
 - [Testing](#testing)
 - [CLI](#cli)
 - [API reference](#api-reference)
+- [Upgrading from 0.1](#upgrading-from-01)
 - [Migrating from `createHttpRoute`](#migrating-from-createhttproute)
 - [Releasing](#releasing)
 
@@ -71,7 +72,7 @@ bun add hono-webhooks hono
 bun add zod
 ```
 
-`hono` (4.6 or newer) is a peer dependency. The package is ESM only. Bun
+`hono` (4.8 or newer) is a peer dependency. The package is ESM only. Bun
 loads the TypeScript source directly; Node and bundlers load the built files
 from `dist`.
 
@@ -312,13 +313,17 @@ defineWebhook({ method: 'POST', path: '/orders/:id' }, async ({ params }) => {
 ```
 
 `onError` changes the response for any error, including 404 and 405. Return a
-`Response`, or nothing to fall back to the default. `console.error` is only
-called when you don't pass `onError`.
+`Response`, or nothing to fall back to the default.
+
+The default 500 response logs the error with `console.error`. Pass
+`logErrors: false` when you log errors yourself, in `onError` or `onEvent`,
+so they aren't logged twice.
 
 ```ts
 import { WebhookValidationError } from 'hono-webhooks'
 
 createWebhooks(webhooks, {
+	logErrors: false,
 	onError(error, c) {
 		if (error instanceof WebhookValidationError) {
 			return c.json({ type: 'validation', target: error.target, issues: error.issues }, 422)
@@ -340,7 +345,7 @@ createWebhooks(webhooks, {
 		logger.info('webhook', {
 			route: event.route, // '/orders/:id', undefined for a 404
 			method: event.method,
-			path: event.path, // '/webhooks/orders/42'
+			path: event.path, // '/orders/42', relative to the mount point
 			status: event.status,
 			durationMs: event.durationMs
 		})
@@ -352,12 +357,49 @@ createWebhooks(webhooks, {
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
 | `c`                                        | The Hono context, e.g. `c.req.header('user-agent')`                                                  |
 | `route`                                    | Matched path pattern, `undefined` for a 404                                                          |
-| `method`, `path`                           | Request method and path                                                                              |
-| `status`, `durationMs`                     | Response status and time spent in the webhooks app                                                   |
-| `params`, `query`, `headers`, `body`, `rawBody` | Each is set once it passed validation, so a request that fails on `body` still reports `params` |
+| `method`, `path`                           | Request method, and path relative to the mount point (`/orders/42`). The full path is `c.req.path` |
+| `status`, `durationMs`                     | Response status, and time spent in the webhooks app in fractional milliseconds                      |
+| `params`, `query`, `headers`               | `Record<string, unknown>`: the schema output, or the raw strings without a schema                    |
+| `body`, `rawBody`                          | Parsed body and raw body                                                                             |
 | `response`                                 | What the handler returned, unless it returned a `Response`                                           |
 | `error`                                    | Whatever was thrown                                                                                  |
-| `validation`                               | `{ target, issues }` when a request part or the response failed its schema                           |
+| `validation`                               | `{ target, issues }` when a request part, the signature or the response failed                      |
+
+Each request part is set once it has passed validation, so a request that
+fails on `body` still reports `params`.
+
+### Summaries and issue messages
+
+`summarizeEvent(event)` flattens an event into a JSON-safe record for logs or
+a database table:
+
+```ts
+import { formatIssues, summarizeEvent } from 'hono-webhooks'
+
+summarizeEvent(event)
+// {
+//   route: '/orders/:id', method: 'POST', path: '/orders/42', status: 400,
+//   durationMs: 1.37,                // rounded to two decimals
+//   ip: '203.0.113.9',               // x-forwarded-for, x-real-ip or cf-connecting-ip
+//   userAgent: 'Shopify-Captain-Hook',
+//   params: { id: '42' }, query: {}, body: null, response: null,
+//   error: null,                     // or { name, message, stack }
+//   validation: {
+//     target: 'body',
+//     message: 'total: Expected number',
+//     issues: [{ path: 'total', message: 'Expected number' }]
+//   }
+// }
+```
+
+- Missing values are `null`, never `undefined`.
+- Request headers are left out on purpose, because they carry signatures and
+  credentials.
+- `ip` comes from headers the client can set, so only trust it behind a
+  proxy that overwrites them.
+
+`formatIssues(issues)` turns Standard Schema issues into one line, like
+`total: Expected number; items.0.id: Required`.
 
 `onEvent` isn't awaited, so a slow database write doesn't delay the response.
 When it returns a promise, the promise is passed to
@@ -460,21 +502,20 @@ defineWebhook(
 ### Storing every call
 
 ```ts
+import { summarizeEvent } from 'hono-webhooks'
+
 createWebhooks(webhooks, {
-	onEvent: (e) =>
-		db.insert(webhookCalls).values({
-			route: e.route ?? null,
-			path: e.path,
-			method: e.method,
-			statusCode: e.status,
-			durationMs: Math.round(e.durationMs),
-			body: e.body ?? null,
-			responseBody: e.response ?? null,
-			errorMessage: e.error instanceof Error ? e.error.message : null,
-			validationError: e.validation ?? null,
-			ipAddress: e.c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ?? null,
-			userAgent: e.c.req.header('user-agent') ?? null
+	logErrors: false, // errors are stored below instead
+	onEvent: async (e) => {
+		if (e.route === '/health') return
+		const call = summarizeEvent(e)
+		await db.insert(webhookCalls).values({
+			...call,
+			errorMessage: call.error?.message ?? null,
+			errorStack: call.error?.stack ?? null,
+			validationError: call.validation?.message ?? null
 		})
+	}
 })
 ```
 
@@ -627,7 +668,9 @@ import {
 	defineWebhook, // (config, handler) => Webhook
 	createWebhooks, // (webhooks, options?) => WebhooksApp  (a Hono app + .webhooks)
 	createWebhookFactory, // <E extends Env>() => { defineWebhook, createWebhooks }
-	WebhookValidationError // extends HTTPException; .target, .issues
+	WebhookValidationError, // extends HTTPException; .target, .issues
+	summarizeEvent, // (event) => WebhookEventSummary, flat and JSON-safe
+	formatIssues // (issues) => 'total: Expected number; ...'
 } from 'hono-webhooks'
 
 import {
@@ -643,6 +686,7 @@ import type {
 	WebhookInput,
 	WebhookResult,
 	WebhookEvent,
+	WebhookEventSummary,
 	WebhooksOptions,
 	WebhookRequestInfo,
 	WebhooksApp,
@@ -657,6 +701,14 @@ import type {
 ```
 
 Use `Webhook` to type a list: `const all: Webhook<AppEnv>[] = [a, b]`.
+
+## Upgrading from 0.1
+
+- `event.path` is relative to the mount point (`/orders/42`), like
+  `event.route`. Use `event.c.req.path` for the full path.
+- Passing `onError` no longer turns off `console.error` for the default 500
+  response. Pass `logErrors: false` for that.
+- `hono` 4.8 or newer is required.
 
 ## Migrating from `createHttpRoute`
 

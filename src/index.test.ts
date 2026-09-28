@@ -7,6 +7,8 @@ import {
 	createWebhookFactory,
 	createWebhooks,
 	defineWebhook,
+	formatIssues,
+	summarizeEvent,
 	type Webhook,
 	type WebhookEvent,
 	type WebhooksOptions,
@@ -446,7 +448,7 @@ describe('onEvent', () => {
 		expect(event).toMatchObject({
 			route: '/orders/:id',
 			method: 'POST',
-			path: '/webhooks/orders/7',
+			path: '/orders/7',
 			status: 200,
 			params: { id: '7' },
 			body: { total: 5 },
@@ -644,5 +646,98 @@ describe('around', () => {
 		const res = await app.request('/webhooks/health')
 		expect(res.status).toBe(503)
 		expect(events).toHaveLength(0)
+	})
+})
+
+describe('events', () => {
+	test('path is relative to the mount point, including dynamic mounts', async () => {
+		const { events, onEvent } = collectEvents()
+		const app = new Hono()
+		app.route('/api/:tenant/hooks', createWebhooks([health], { onEvent }))
+		await app.request('/api/acme/hooks/health')
+		await app.request('/api/acme/hooks/missing/deep')
+		expect(events.map((e) => [e.route, e.path])).toEqual([
+			['/health', '/health'],
+			[undefined, '/missing/deep']
+		])
+		expect(events[0]?.c.req.path).toBe('/api/acme/hooks/health')
+	})
+
+	test('logErrors: false keeps the default 500 without console.error', async () => {
+		const log = silenceConsoleError()
+		const boom = defineWebhook({ method: 'GET', path: '/boom' }, () => {
+			throw new Error('boom')
+		})
+		const res = await mount([boom], { logErrors: false }).request(
+			'/webhooks/boom'
+		)
+		expect(res.status).toBe(500)
+		expect(log).not.toHaveBeenCalled()
+		log.mockRestore()
+	})
+
+	test('formatIssues joins paths and messages', () => {
+		expect(
+			formatIssues([
+				{ message: 'Expected number', path: ['total'] },
+				{ message: 'Required', path: ['items', 0, { key: 'id' }] },
+				{ message: 'Malformed JSON' }
+			])
+		).toBe('total: Expected number; items.0.id: Required; Malformed JSON')
+	})
+
+	test('summarizeEvent returns a flat, JSON-safe record', async () => {
+		silenceConsoleError()
+		const { events, onEvent } = collectEvents()
+		const typed = defineWebhook(
+			{
+				method: 'POST',
+				path: '/orders/:id',
+				body: z.object({ total: z.number() })
+			},
+			() => {
+				throw new TypeError('db down')
+			}
+		)
+		const app = mount([typed], { onEvent })
+		await app.request('/webhooks/orders/1?x=1', {
+			...post({ total: 'x' }),
+			headers: {
+				'content-type': 'application/json',
+				'x-forwarded-for': '203.0.113.9, 10.0.0.1',
+				'user-agent': 'Shopify-Captain-Hook',
+				authorization: 'secret'
+			}
+		})
+		await app.request('/webhooks/orders/1', post({ total: 1 }))
+
+		const [invalid, failed] = events.map(summarizeEvent)
+		expect(invalid).toMatchObject({
+			route: '/orders/:id',
+			method: 'POST',
+			path: '/orders/1',
+			status: 400,
+			ip: '203.0.113.9',
+			userAgent: 'Shopify-Captain-Hook',
+			params: { id: '1' },
+			query: { x: '1' },
+			body: null,
+			response: null,
+			validation: {
+				target: 'body',
+				message: expect.stringMatching(/^total: /),
+				issues: [{ path: 'total', message: expect.any(String) }]
+			}
+		})
+		expect(JSON.stringify(invalid)).not.toContain('secret')
+		expect(failed?.error).toMatchObject({
+			name: 'TypeError',
+			message: 'db down'
+		})
+		expect(failed?.validation).toBeNull()
+		expect(JSON.parse(JSON.stringify(failed))).toEqual(failed)
+		expect(
+			String(failed?.durationMs).split('.')[1]?.length ?? 0
+		).toBeLessThanOrEqual(2)
 	})
 })

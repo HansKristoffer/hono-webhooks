@@ -27,6 +27,7 @@ export type ValidationTarget =
 	| 'params'
 	| 'query'
 	| 'headers'
+	| 'signature'
 	| 'body'
 	| 'response'
 
@@ -51,13 +52,28 @@ export type PathParams<P extends string> = [ParamKeys<P>] extends [never]
 	? Record<string, never>
 	: UnionToIntersection<ParamKeyToRecord<ParamKeys<P>>>
 
+/** What a `verify` function gets: the request before its body is parsed. */
+export interface VerifyInput<E extends Env = any> {
+	c: Context<E>
+	/** The body exactly as received. */
+	rawBody: string
+	/** All request headers, lower-case names, not schema-validated. */
+	headers: Record<string, string>
+}
+
+/** Checks a request's signature. `hono-webhooks/signatures` has ready-made ones. */
+export type Verify<E extends Env = any> = (
+	input: VerifyInput<E>
+) => MaybePromise<boolean>
+
 export interface WebhookConfig<
 	P extends string = string,
 	TParams extends Schema | undefined = Schema | undefined,
 	TQuery extends Schema | undefined = Schema | undefined,
 	THeaders extends Schema | undefined = Schema | undefined,
 	TBody extends Schema | undefined = Schema | undefined,
-	TResponse extends Schema | undefined = Schema | undefined
+	TResponse extends Schema | undefined = Schema | undefined,
+	E extends Env = any
 > {
 	method: WebhookMethod
 	/** Hono path pattern, relative to where the webhooks are mounted. */
@@ -67,6 +83,13 @@ export interface WebhookConfig<
 	/** Header names are lower-case. */
 	headers?: THeaders
 	body?: TBody
+	/**
+	 * Checks the signature before the body is parsed or validated. Returning
+	 * `false` answers `401 { error: 'Invalid signature' }`.
+	 *
+	 * @example verify: shopify.verify((c) => c.env.SHOPIFY_SECRET)
+	 */
+	verify?: Verify<E>
 	/**
 	 * Checks what the handler returns. A mismatch is reported on
 	 * `WebhookEvent.validation` and the response is still sent.
@@ -114,7 +137,7 @@ export interface Webhook<
 	TBody extends Schema | undefined = any,
 	TResponse extends Schema | undefined = any
 > {
-	config: WebhookConfig<P, TParams, TQuery, THeaders, TBody, TResponse>
+	config: WebhookConfig<P, TParams, TQuery, THeaders, TBody, TResponse, E>
 	// Method syntax keeps the parameter bivariant, so any webhook fits Webhook<E>[].
 	handler(
 		input: WebhookInput<E, P, TParams, TQuery, THeaders, TBody>
@@ -168,13 +191,18 @@ export type WebhooksApp<E extends Env = any> = Hono<E> & {
 	readonly webhooks: readonly Webhook<E>[]
 }
 
-/** Thrown when a request part fails its schema. Answers 400 by default. */
+/**
+ * Thrown when a request part fails its schema (400) or the signature check
+ * fails (401).
+ */
 export class WebhookValidationError extends HTTPException {
 	constructor(
 		readonly target: Exclude<ValidationTarget, 'response'>,
 		readonly issues: readonly StandardSchemaV1.Issue[]
 	) {
-		super(400, { message: `Invalid ${target}` })
+		super(target === 'signature' ? 401 : 400, {
+			message: `Invalid ${target}`
+		})
 		this.name = 'WebhookValidationError'
 	}
 }
@@ -188,7 +216,7 @@ function makeDefineWebhook<E extends Env>() {
 		TBody extends Schema | undefined = undefined,
 		TResponse extends Schema | undefined = undefined
 	>(
-		config: WebhookConfig<P, TParams, TQuery, THeaders, TBody, TResponse>,
+		config: WebhookConfig<P, TParams, TQuery, THeaders, TBody, TResponse, E>,
 		handler: (
 			input: WebhookInput<E, P, TParams, TQuery, THeaders, TBody>
 		) => WebhookResult<TResponse>
@@ -229,7 +257,7 @@ async function parse(
 
 function defaultErrorResponse(error: unknown, c: Context, log: boolean) {
 	if (error instanceof WebhookValidationError) {
-		return c.json({ error: error.message, issues: error.issues }, 400)
+		return c.json({ error: error.message, issues: error.issues }, error.status)
 	}
 	if (error instanceof HTTPException) {
 		return error.res ?? c.json({ error: error.message }, error.status)
@@ -320,6 +348,18 @@ function makeCreateWebhooks<E extends Env>() {
 					event.query = await parse(config.query, c.req.query(), 'query')
 					event.headers = await parse(config.headers, c.req.header(), 'headers')
 					event.rawBody = await c.req.text()
+					if (
+						config.verify &&
+						!(await config.verify({
+							c,
+							rawBody: event.rawBody,
+							headers: c.req.header()
+						}))
+					) {
+						throw new WebhookValidationError('signature', [
+							{ message: 'Signature does not match' }
+						])
+					}
 					event.body = await parse(
 						config.body,
 						parseBody(

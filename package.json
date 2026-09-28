@@ -42,11 +42,17 @@
       "bun": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./signatures": {
+      "types": "./dist/signatures.d.ts",
+      "bun": "./src/signatures.ts",
+      "import": "./dist/signatures.js",
+      "default": "./dist/signatures.js"
     }
   },
   "scripts": {
     "build": "rm -rf dist && bun run build:js && bun run build:types",
-    "build:js": "bun build ./src/index.ts ./src/cli.ts --outdir ./dist --target node --packages external",
+    "build:js": "bun build ./src/index.ts ./src/signatures.ts ./src/cli.ts --outdir ./dist --target node --packages external",
     "build:types": "tsgo -p tsconfig.build.json",
     "prepublishOnly": "bun run build",
     "test": "bun test",

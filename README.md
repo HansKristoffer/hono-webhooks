@@ -42,7 +42,9 @@ app.route('/webhooks', createWebhooks([orderPaid]))
 - **One hook for observability.** `onEvent` fires once per request with the
   route, status, duration, validated input, response and error. Use it for
   logs, metrics, traces or an audit table.
-- **A CLI** to list webhooks, print their JSON Schemas and send test requests.
+- **Tooling.** `describeWebhooks` gives JSON Schemas for docs and admin pages,
+  `testWebhook` runs one webhook in tests with typed input, and the CLI lists
+  webhooks and sends (signed) test requests.
 
 ## Contents
 
@@ -57,6 +59,7 @@ app.route('/webhooks', createWebhooks([orderPaid]))
 - [Errors](#errors)
 - [Observability with `onEvent`](#observability-with-onevent)
 - [Recipes](#recipes)
+- [Describing webhooks](#describing-webhooks)
 - [Testing](#testing)
 - [CLI](#cli)
 - [API reference](#api-reference)
@@ -607,26 +610,69 @@ app.route('/webhooks', webhooks)
 
 Hono's `showRoutes(app)` from `hono/dev` prints every route at startup.
 
+## Describing webhooks
+
+`describeWebhooks(appOrArray)` returns one entry per webhook, with JSON
+Schemas from any library that implements
+[Standard JSON Schema](https://standardschema.dev) (Zod 4.2+ does). Use it for
+an admin page, docs or an OpenAPI document:
+
+```ts
+import { describeWebhooks } from 'hono-webhooks'
+
+describeWebhooks(webhooks)
+// [{
+//   method: 'POST',
+//   path: '/orders/:id',
+//   description: 'Order paid',
+//   verified: true,          // has a verify function
+//   bodyType: 'auto',
+//   jsonSchema: { params: null, query: null, headers: null, body: {...}, response: {...} }
+// }]
+
+describeWebhooks(webhooks, { target: 'openapi-3.0' }) // or 'draft-07'
+```
+
+Request parts use the schema's input side (what the sender sends), `response`
+its output side. A part is `null` when it has no schema, or when the library
+can't produce JSON Schema.
+
 ## Testing
 
-The webhooks app is a Hono app, so `request()` runs the full pipeline:
-routing, validation, handler and response.
+`testWebhook(webhook, input)` sends one request through a single webhook and
+returns the `Response`. It runs everything a real request does: signature
+check, validation, handler and response handling. Its input is typed from the
+webhook's schemas:
 
 ```ts
 import { expect, test } from 'bun:test'
-import { webhooks } from './webhooks'
+import { testWebhook } from 'hono-webhooks'
+import { shopify } from 'hono-webhooks/signatures'
+import { orderPaid } from './webhooks/order-paid'
 
-test('rejects an order without a total', async () => {
-	const res = await webhooks.request('/orders/42', {
-		method: 'POST',
-		headers: { 'content-type': 'application/json' },
-		body: JSON.stringify({})
+test('marks the order paid', async () => {
+	const res = await testWebhook(orderPaid, {
+		params: { orderId: '42' }, // filled into the path
+		query: { dryRun: 'true' },
+		body: { amount: 10, currency: 'DKK' }, // typed from the body schema
+		sign: (rawBody) => shopify.sign(rawBody, 'test-secret'),
+		env: { SHOPIFY_WEBHOOK_SECRET: 'test-secret' }
 	})
-	expect(res.status).toBe(400)
+	expect(res.status).toBe(200)
 })
 ```
 
-Pass bindings as the third argument: `webhooks.request(path, init, env)`.
+| Input     | Description                                                                                                  |
+| --------- | ------------------------------------------------------------------------------------------------------------ |
+| `params`  | Filled into the path pattern. Use `path` instead for wildcard patterns.                                      |
+| `query`, `headers` | String records.                                                                                     |
+| `body`    | A string is sent as is. Anything else is sent as JSON, or url-encoded when `bodyType` is `'form'`.            |
+| `sign`    | Gets the exact raw body and returns headers to add, e.g. `(raw) => github.sign(raw, secret)`.                 |
+| `env`     | Bindings, available as `c.env`.                                                                              |
+| `options` | `createWebhooks` options, e.g. `{ onEvent }`.                                                                |
+
+To test a whole webhooks app with its routing, use Hono's `request()`:
+`webhooks.request('/orders/42', init, env)`.
 
 ## CLI
 
@@ -638,28 +684,42 @@ Commands:
   schema <path>             Print the JSON Schemas of the webhooks at <path>
   test <method> <path>      Send a request through the webhooks app
 
+Options:
+  -r, --preload <module>    Import a module first (e.g. to load secrets), repeatable
+
 Options for test:
   -b, --body <text>         Request body (JSON sets content-type: application/json)
   -q, --query <params>      Query string, e.g. "a=1&b=2"
   -H, --header <k: v>       Request header, repeatable
+  -s, --sign <scheme>       Sign the body: github, shopify, stripe
+  -e, --secret-env <name>   Environment variable holding the signing secret
 ```
 
-`<module>` is a file that exports the `createWebhooks()` result, as default or
-as any named export.
+`<module>` exports either a `createWebhooks()` app or an array of webhooks, as
+default or as any named export. With an array, the CLI builds the app itself,
+so it can point straight at the file that lists your webhooks.
 
 ```bash
 bunx hono-webhooks ./src/webhooks/index.ts list
 bunx hono-webhooks ./src/webhooks/index.ts schema /orders/:id
 bunx hono-webhooks ./src/webhooks/index.ts test POST /orders/42 -b '{"total":10}' -H 'x-api-key: dev'
+
+# Load secrets first, then sign the body like Shopify would
+bunx hono-webhooks ./src/webhooks/index.ts test POST /shopify/orders -b '{"id":1}' \
+  --preload ./src/secrets.ts --sign shopify --secret-env SHOPIFY_WEBHOOK_SECRET
 ```
 
 - `test` sends a real request through the webhooks app (without the parent
   app's middleware) and exits with code 1 on a 4xx or 5xx response.
-- `schema` prints JSON Schema for libraries that implement
-  [Standard JSON Schema](https://standardschema.dev) (Zod 4.2+ does).
+- `--preload` imports modules in order, before the webhooks module. It takes
+  a file path or a package name, and works the same under Bun and Node.
+- `--sign` signs the exact `--body` with the secret read from the environment
+  variable named by `--secret-env`, after preloading, so a preloaded module
+  can set it.
+- `schema` prints the JSON Schemas from
+  [`describeWebhooks`](#describing-webhooks).
 - The CLI imports your TypeScript file. That works under Bun, and under Node
-  22.18+ which strips types natively. If the module needs setup first (loading
-  secrets, for example), preload it: `bun --preload ./src/secrets.ts x hono-webhooks ...`.
+  22.18+ which strips types natively.
 
 ## API reference
 
@@ -669,6 +729,8 @@ import {
 	createWebhooks, // (webhooks, options?) => WebhooksApp  (a Hono app + .webhooks)
 	createWebhookFactory, // <E extends Env>() => { defineWebhook, createWebhooks }
 	WebhookValidationError, // extends HTTPException; .target, .issues
+	describeWebhooks, // (appOrArray, { target? }) => WebhookDescription[]
+	testWebhook, // (webhook, input?) => Promise<Response>
 	summarizeEvent, // (event) => WebhookEventSummary, flat and JSON-safe
 	formatIssues // (issues) => 'total: Expected number; ...'
 } from 'hono-webhooks'
@@ -687,6 +749,8 @@ import type {
 	WebhookResult,
 	WebhookEvent,
 	WebhookEventSummary,
+	WebhookDescription,
+	TestWebhookInput,
 	WebhooksOptions,
 	WebhookRequestInfo,
 	WebhooksApp,

@@ -1,8 +1,11 @@
-import type { StandardSchemaV1 } from '@standard-schema/spec'
+import type {
+	StandardJSONSchemaV1,
+	StandardSchemaV1
+} from '@standard-schema/spec'
 import { type Context, type Env, Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { basePath } from 'hono/route'
-import type { ParamKeys, ParamKeyToRecord } from 'hono/types'
+import type { ParamKeys } from 'hono/types'
 
 export type { StandardSchemaV1 }
 
@@ -45,13 +48,17 @@ type UnionToIntersection<U> = (
 	? I
 	: never
 
+type ParamRecord<K extends string> = K extends `${infer Name}?`
+	? { [N in Name]?: string }
+	: { [N in K]: string }
+
 /**
  * Params typed from the path string: `/users/:id` gives `{ id: string }`,
- * `/files/:name?` gives `{ name: string | undefined }`.
+ * `/files/:name?` gives `{ name?: string }`.
  */
 export type PathParams<P extends string> = [ParamKeys<P>] extends [never]
 	? Record<string, never>
-	: UnionToIntersection<ParamKeyToRecord<ParamKeys<P>>>
+	: UnionToIntersection<ParamRecord<ParamKeys<P>>>
 
 /** What a `verify` function gets: the request before its body is parsed. */
 export interface VerifyInput<E extends Env = any> {
@@ -603,4 +610,146 @@ export function summarizeEvent(event: WebhookEvent): WebhookEventSummary {
 				}
 			: null
 	}
+}
+
+export interface WebhookDescription {
+	method: WebhookMethod
+	path: string
+	description: string | null
+	/** Whether the webhook has a `verify` function. */
+	verified: boolean
+	bodyType: BodyType
+	/**
+	 * JSON Schema per part: the input side for request parts, the output side
+	 * for `response`. `null` when the part has no schema or its library
+	 * doesn't implement Standard JSON Schema.
+	 */
+	jsonSchema: Record<
+		'params' | 'query' | 'headers' | 'body' | 'response',
+		Record<string, unknown> | null
+	>
+}
+
+function toJsonSchema(
+	schema: Schema | undefined,
+	side: 'input' | 'output',
+	target: StandardJSONSchemaV1.Target
+) {
+	const props = (schema as Partial<StandardJSONSchemaV1> | undefined)?.[
+		'~standard'
+	]
+	try {
+		return props?.jsonSchema?.[side]({ target }) ?? null
+	} catch {
+		return null
+	}
+}
+
+/**
+ * Describes webhooks for docs, admin pages or OpenAPI, with JSON Schemas from
+ * any library that implements Standard JSON Schema (Zod 4.2+, for example).
+ */
+export function describeWebhooks(
+	source: WebhooksApp | readonly Webhook[],
+	{ target = 'draft-2020-12' }: { target?: StandardJSONSchemaV1.Target } = {}
+): WebhookDescription[] {
+	const webhooks = 'webhooks' in source ? source.webhooks : source
+	return webhooks.map(({ config }) => ({
+		method: config.method,
+		path: config.path,
+		description: config.description ?? null,
+		verified: Boolean(config.verify),
+		bodyType: config.bodyType ?? 'auto',
+		jsonSchema: {
+			params: toJsonSchema(config.params, 'input', target),
+			query: toJsonSchema(config.query, 'input', target),
+			headers: toJsonSchema(config.headers, 'input', target),
+			body: toJsonSchema(config.body, 'input', target),
+			response: toJsonSchema(config.response, 'output', target)
+		}
+	}))
+}
+
+type In<S, Fallback> = S extends Schema
+	? StandardSchemaV1.InferInput<S>
+	: Fallback
+
+/** What `testWebhook` sends, typed from the webhook's schemas. */
+export type TestWebhookInput<W> =
+	W extends Webhook<infer E, infer P, infer TParams, any, any, infer TBody>
+		? {
+				/** Filled into the path pattern. */
+				params?: In<TParams, PathParams<P>>
+				/** Overrides the path, e.g. for wildcard patterns. */
+				path?: string
+				query?: Record<string, string>
+				headers?: Record<string, string>
+				/**
+				 * A string is sent as is (`text/plain` unless you set a content
+				 * type). Anything else is sent as JSON, or url-encoded when the
+				 * webhook's `bodyType` is `'form'`.
+				 */
+				body?: In<TBody, unknown> | string
+				/** Headers computed from the raw body, e.g. `(raw) => shopify.sign(raw, secret)`. */
+				sign?: (rawBody: string) => MaybePromise<Record<string, string>>
+				/** Bindings, available as `c.env`. */
+				env?: E extends { Bindings: infer B } ? B : unknown
+				/** `onEvent`, `onError` and so on, as for `createWebhooks`. */
+				options?: WebhooksOptions<E>
+			}
+		: never
+
+function fillPath(pattern: string, params: Record<string, unknown>) {
+	return pattern.replace(/\/:(\w+)(?:\{[^}]*\})?\??/g, (_, name: string) => {
+		const value = params[name]
+		return value === undefined ? '' : `/${encodeURIComponent(String(value))}`
+	})
+}
+
+/**
+ * Sends one request through a single webhook, with routing, signature check,
+ * validation and response handling, and returns the `Response`.
+ *
+ * @example
+ * const res = await testWebhook(orderPaid, {
+ *   params: { orderId: '42' },
+ *   body: { amount: 10, currency: 'DKK' }
+ * })
+ */
+export async function testWebhook<W extends Webhook>(
+	webhook: W,
+	input: TestWebhookInput<W> = {} as TestWebhookInput<W>
+): Promise<Response> {
+	const { config } = webhook
+	const { body, sign, env, options } = input as TestWebhookInput<Webhook>
+	const headers = new Headers(input.headers)
+	let rawBody: string | undefined
+	if (typeof body === 'string') {
+		rawBody = body
+		if (!headers.has('content-type')) headers.set('content-type', 'text/plain')
+	} else if (body !== undefined && config.bodyType === 'form') {
+		rawBody = new URLSearchParams(body as Record<string, string>).toString()
+		if (!headers.has('content-type')) {
+			headers.set('content-type', 'application/x-www-form-urlencoded')
+		}
+	} else if (body !== undefined) {
+		rawBody = JSON.stringify(body)
+		if (!headers.has('content-type')) {
+			headers.set('content-type', 'application/json')
+		}
+	}
+	for (const [name, value] of Object.entries(
+		(await sign?.(rawBody ?? '')) ?? {}
+	)) {
+		headers.set(name, value)
+	}
+	const path =
+		input.path ??
+		fillPath(config.path, (input.params ?? {}) as Record<string, unknown>)
+	const query = new URLSearchParams(input.query).toString()
+	return createWebhooks([webhook], options).request(
+		`${path || '/'}${query ? `?${query}` : ''}`,
+		{ method: config.method, headers, body: rawBody },
+		env as object | undefined
+	)
 }

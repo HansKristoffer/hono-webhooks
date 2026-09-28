@@ -364,6 +364,33 @@ When it returns a promise, the promise is passed to
 `c.executionCtx.waitUntil()` on runtimes that have one (Cloudflare Workers,
 Vercel Edge), and a rejection is logged instead of crashing the request.
 
+`onEvent` is called inside the request's async context, before the response
+is returned. The active OpenTelemetry span, `AsyncLocalStorage` values and
+anything set up in [`around`](#wrapping-requests-with-around) are available
+there, so log lines written in `onEvent` attach to the request.
+
+### Wrapping requests with `around`
+
+`around` wraps every request, including 404s and 405s, and already knows the
+matched route. Use it for anything that has to surround the whole request:
+a tracing span, an `AsyncLocalStorage` scope, a timer. Call `next()` to
+handle the request; it returns the response and runs `onEvent` inside your
+wrapper.
+
+```ts
+createWebhooks(webhooks, {
+	around: async ({ c, route, method }, next) => {
+		const res = await next()
+		console.log(method, route ?? '(no route)', res.status)
+		return res
+	}
+})
+```
+
+`route` is the pattern relative to the mount point (`/orders/:id`), or
+`undefined` for a 404. If `around` returns a response without calling
+`next()`, the request isn't handled and `onEvent` doesn't run.
+
 ## Recipes
 
 ### Stripe events
@@ -468,9 +495,45 @@ createWebhooks(webhooks, {
 })
 ```
 
-For traces, add a tracing middleware (for example
-[`@hono/otel`](https://github.com/honojs/middleware/tree/main/packages/otel))
-on the parent app before `app.route('/webhooks', ...)`.
+### OpenTelemetry traces
+
+One span per request, named by the route pattern (low cardinality), with
+`onEvent` logs attached to it:
+
+```ts
+import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api'
+
+const tracer = trace.getTracer('webhooks')
+
+createWebhooks(webhooks, {
+	around: ({ c, route, method }, next) =>
+		tracer.startActiveSpan(
+			`webhook ${method} ${route ?? 'unmatched'}`,
+			{
+				kind: SpanKind.SERVER,
+				attributes: {
+					'http.request.method': method,
+					'http.route': route ?? 'unmatched',
+					'url.path': c.req.path
+				}
+			},
+			async (span) => {
+				try {
+					const res = await next()
+					span.setAttribute('http.response.status_code', res.status)
+					if (res.status >= 500) span.setStatus({ code: SpanStatusCode.ERROR })
+					return res
+				} finally {
+					span.end()
+				}
+			}
+		),
+	onEvent: (e) => {
+		// trace.getActiveSpan() is the span above
+		if (e.error instanceof Error) trace.getActiveSpan()?.recordException(e.error)
+	}
+})
+```
 
 ### Skipping noise
 
@@ -581,6 +644,7 @@ import type {
 	WebhookResult,
 	WebhookEvent,
 	WebhooksOptions,
+	WebhookRequestInfo,
 	WebhooksApp,
 	Verify,
 	VerifyInput,
@@ -607,7 +671,7 @@ For code that used the in-app `lib/webhook` this package came from:
 | `rawBody: true` + checking the signature by hand | `verify: shopify.verify(secret)` (or your own function); `rawBody` is always passed too |
 | `request` in the handler                       | `c.req.raw`                                                                    |
 | `useHonoWebhooks(app)`                         | `app.route('/webhooks', createWebhooks(webhooks, { onEvent }))`               |
-| Built-in OTel span, logger, `recordWebhookCall` | `onEvent` (see [Recipes](#recipes)) and tracing middleware                    |
+| Built-in OTel span, logger, `recordWebhookCall` | `around` for the span, `onEvent` for logs and storage (see [Recipes](#recipes)) |
 | `HEAD` / custom methods in `method`            | `GET` routes answer `HEAD` automatically                                      |
 | Response schema mismatch recorded as 500       | Recorded as `event.validation` with the real status                           |
 | Malformed JSON without a schema → `body: null` | `400 Invalid body`. Use `bodyType: 'text'` to accept anything                 |

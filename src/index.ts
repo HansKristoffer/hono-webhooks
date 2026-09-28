@@ -171,11 +171,31 @@ export interface WebhookEvent<E extends Env = any> {
 	}
 }
 
+/** What `around` knows about a request before it is handled. */
+export interface WebhookRequestInfo<E extends Env = any> {
+	c: Context<E>
+	/** The matched path pattern, e.g. `/users/:id`. `undefined` for a 404. */
+	route: string | undefined
+	method: string
+}
+
 export interface WebhooksOptions<E extends Env = any> {
 	/**
-	 * Called after every request: log it, store it, record metrics. Not
-	 * awaited; a returned promise is handed to `executionCtx.waitUntil` when
-	 * the runtime has one, and its rejection is logged.
+	 * Wraps each request, 404s and 405s included, with the route already
+	 * known: start a span, set up `AsyncLocalStorage`, time it. Call `next()`
+	 * to handle the request (which also runs `onEvent`) and return its
+	 * response.
+	 */
+	around?: (
+		info: WebhookRequestInfo<E>,
+		next: () => Promise<Response>
+	) => Promise<Response>
+	/**
+	 * Called after every request: log it, store it, record metrics. Runs
+	 * inside the request's async context (and inside `around`), so the active
+	 * span and `AsyncLocalStorage` values are available. Not awaited; a
+	 * returned promise is handed to `executionCtx.waitUntil` when the runtime
+	 * has one, and its rejection is logged.
 	 */
 	onEvent?: (event: WebhookEvent<E>) => MaybePromise<void>
 	/**
@@ -303,7 +323,7 @@ function makeCreateWebhooks<E extends Env>() {
 
 		type Run = (c: Context<E>, event: WebhookEvent<E>) => Promise<Response>
 		const handle = (route: string | undefined, run: Run) => {
-			return async (c: Context<E>) => {
+			const execute = async (c: Context<E>) => {
 				const start = performance.now()
 				const event: WebhookEvent<E> = {
 					c,
@@ -330,6 +350,11 @@ function makeCreateWebhooks<E extends Env>() {
 				if (options.onEvent) report(c as Context, options.onEvent(event))
 				return res
 			}
+			const { around } = options
+			return (c: Context<E>) =>
+				around
+					? around({ c, route, method: c.req.method }, () => execute(c))
+					: execute(c)
 		}
 
 		// Hono tries handlers in registration order, so static paths go first

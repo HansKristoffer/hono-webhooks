@@ -92,8 +92,8 @@ export interface WebhookConfig<
 	headers?: THeaders
 	body?: TBody
 	/**
-	 * Checks the signature before the body is parsed or validated. Returning
-	 * `false` answers `401 { error: 'Invalid signature' }`.
+	 * Checks the signature right after routing, before anything is validated
+	 * or parsed. Returning `false` answers `401 { error: 'Invalid signature' }`.
 	 *
 	 * @example verify: shopify.verify((c) => c.env.SHOPIFY_SECRET)
 	 */
@@ -392,6 +392,21 @@ function makeCreateWebhooks<E extends Env>() {
 				config.method,
 				config.path,
 				handle(config.path, async (c, event) => {
+					// The signature is checked first, so unauthenticated callers only
+					// ever see 401, never a description of the schemas.
+					event.rawBody = await c.req.text()
+					if (
+						config.verify &&
+						!(await config.verify({
+							c,
+							rawBody: event.rawBody,
+							headers: c.req.header()
+						}))
+					) {
+						throw new WebhookValidationError('signature', [
+							{ message: 'Signature does not match' }
+						])
+					}
 					type Parts = Record<string, unknown>
 					event.params = (await parse(
 						config.params,
@@ -408,19 +423,6 @@ function makeCreateWebhooks<E extends Env>() {
 						c.req.header(),
 						'headers'
 					)) as Parts
-					event.rawBody = await c.req.text()
-					if (
-						config.verify &&
-						!(await config.verify({
-							c,
-							rawBody: event.rawBody,
-							headers: c.req.header()
-						}))
-					) {
-						throw new WebhookValidationError('signature', [
-							{ message: 'Signature does not match' }
-						])
-					}
 					event.body = await parse(
 						config.body,
 						parseBody(

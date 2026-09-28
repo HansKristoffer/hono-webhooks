@@ -124,6 +124,24 @@ describe('verify option', () => {
 		expect(await res.json()).toEqual({ id: 7 })
 	})
 
+	test('an unsigned request gets 401 before headers are validated', async () => {
+		const topic = defineWebhook(
+			{
+				method: 'POST',
+				path: '/topic',
+				verify: shopify.verify(secret),
+				headers: z.object({ 'x-shopify-topic': z.string() })
+			},
+			({ headers }) => headers['x-shopify-topic']
+		)
+		const res = await createWebhooks([topic]).request('/topic', {
+			method: 'POST',
+			body: '{}'
+		})
+		expect(res.status).toBe(401)
+		expect(await res.text()).not.toContain('x-shopify-topic')
+	})
+
 	test('a bad signature answers 401 before the body is parsed', async () => {
 		events.length = 0
 		const res = await send('{not json', { 'x-shopify-hmac-sha256': 'AAAA' })

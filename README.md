@@ -179,10 +179,11 @@ Malformed JSON is a `400` with `issues: [{ message: 'Malformed JSON' }]`.
 
 ## Signature verification
 
-`verify` runs after the params, query and headers are validated but **before
-the body is parsed**, on the raw body. A request with a bad signature never
-reaches JSON parsing or the body schema, so signed webhooks can use `body`
-like any other webhook:
+`verify` runs on the raw body **right after routing, before anything is
+validated or parsed**. A request with a bad signature gets a 401 and never
+reaches the params, query, headers or body schemas, so unauthenticated
+callers never see a description of your schemas. Signed webhooks can use
+`headers` and `body` schemas like any other webhook:
 
 ```ts
 import { shopify } from 'hono-webhooks/signatures'

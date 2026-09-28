@@ -1,0 +1,74 @@
+{
+  "name": "hono-webhooks",
+  "version": "0.1.0",
+  "description": "Type-safe webhook routes for Hono, validated with any Standard Schema library (Zod, Valibot, ArkType)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HansKristoffer/hono-webhooks.git"
+  },
+  "homepage": "https://github.com/HansKristoffer/hono-webhooks#readme",
+  "bugs": {
+    "url": "https://github.com/HansKristoffer/hono-webhooks/issues"
+  },
+  "author": "Kristoffer Hansen",
+  "keywords": [
+    "hono",
+    "webhooks",
+    "webhook",
+    "standard-schema",
+    "zod",
+    "valibot",
+    "arktype",
+    "typescript",
+    "type-safe"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "dist",
+    "!src/**/*.test.ts"
+  ],
+  "sideEffects": false,
+  "bin": {
+    "hono-webhooks": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && bun run build:js && bun run build:types",
+    "build:js": "bun build ./src/index.ts ./src/cli.ts --outdir ./dist --target node --packages external",
+    "build:types": "tsgo -p tsconfig.build.json",
+    "prepublishOnly": "bun run build",
+    "test": "bun test",
+    "lint": "bun run typecheck && bun biome check",
+    "lint:write": "bun run typecheck && bun biome check --write",
+    "typecheck": "tsgo --noEmit",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "@standard-schema/spec": "^1.1.0"
+  },
+  "peerDependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/bun": "^1.4.2",
+    "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "hono": "^4.13.10",
+    "husky": "^9.1.7",
+    "typescript": "^7.0.2",
+    "valibot": "^1.5.0",
+    "zod": "^4.6.5"
+  }
+}

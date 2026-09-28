@@ -34,7 +34,7 @@
   ],
   "sideEffects": false,
   "bin": {
-    "hono-webhooks": "./dist/cli.js"
+    "hono-webhooks": "dist/cli.js"
   },
   "exports": {
     ".": {

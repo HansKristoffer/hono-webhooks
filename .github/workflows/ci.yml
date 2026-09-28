@@ -34,3 +34,6 @@ jobs:
       - run: bun run build
       # Runs the built CLI and package under Node against a fixture app.
       - run: node dist/cli.js scripts/fixture-webhooks.ts test GET /health
+      - run: >-
+          node dist/cli.js scripts/fixture-webhooks.ts test POST /orders/1 -b '{"total":1}'
+          -r ./scripts/fixture-preload.ts --sign shopify --secret-env FIXTURE_SECRET

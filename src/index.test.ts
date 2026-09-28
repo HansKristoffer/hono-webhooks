@@ -7,8 +7,10 @@ import {
 	createWebhookFactory,
 	createWebhooks,
 	defineWebhook,
+	describeWebhooks,
 	formatIssues,
 	summarizeEvent,
+	testWebhook,
 	type Webhook,
 	type WebhookEvent,
 	type WebhooksOptions,
@@ -739,5 +741,116 @@ describe('events', () => {
 		expect(
 			String(failed?.durationMs).split('.')[1]?.length ?? 0
 		).toBeLessThanOrEqual(2)
+	})
+})
+
+describe('describeWebhooks', () => {
+	const order = defineWebhook(
+		{
+			method: 'POST',
+			path: '/orders/:id',
+			description: 'Order paid',
+			verify: () => true,
+			body: z.object({ total: z.number() }),
+			response: z.object({ ok: z.boolean() })
+		},
+		() => ({ ok: true })
+	)
+	const valibot = defineWebhook(
+		{ method: 'GET', path: '/v', query: v.object({ q: v.string() }) },
+		() => {}
+	)
+
+	test('returns JSON Schemas from an app or an array', () => {
+		const [described] = describeWebhooks(createWebhooks([order]))
+		expect(described).toMatchObject({
+			method: 'POST',
+			path: '/orders/:id',
+			description: 'Order paid',
+			verified: true,
+			bodyType: 'auto',
+			jsonSchema: {
+				params: null,
+				body: { type: 'object', required: ['total'] },
+				response: { type: 'object', required: ['ok'] }
+			}
+		})
+		expect(describeWebhooks([order])).toEqual(
+			describeWebhooks(createWebhooks([order]))
+		)
+	})
+
+	test('is null for libraries without Standard JSON Schema', () => {
+		const [described] = describeWebhooks([valibot])
+		expect(described?.jsonSchema.query).toBeNull()
+		expect(described?.description).toBeNull()
+	})
+})
+
+describe('testWebhook', () => {
+	const order = defineWebhook(
+		{
+			method: 'POST',
+			path: '/orders/:id/:note?',
+			query: z.object({ dry: z.enum(['1', '0']).optional() }),
+			body: z.object({ total: z.number() })
+		},
+		({ c, params, query, body, headers }) => ({
+			id: params.id,
+			note: params.note ?? null,
+			dry: query.dry ?? null,
+			total: body.total,
+			trace: headers['x-trace'] ?? null,
+			region: (c.env as { REGION?: string } | undefined)?.REGION ?? null
+		})
+	)
+
+	test('runs the full pipeline with typed input', async () => {
+		const res = await testWebhook(order, {
+			params: { id: 'a b' },
+			query: { dry: '1' },
+			headers: { 'x-trace': 't1' },
+			body: { total: 5 },
+			env: { REGION: 'eu' }
+		})
+		expect(await res.json()).toEqual({
+			id: 'a b',
+			note: null,
+			dry: '1',
+			total: 5,
+			trace: 't1',
+			region: 'eu'
+		})
+	})
+
+	test('validates like a real request', async () => {
+		const res = await testWebhook(order, {
+			params: { id: '1', note: 'x' },
+			// @ts-expect-error total must be a number
+			body: { total: 'five' }
+		})
+		expect(res.status).toBe(400)
+	})
+
+	test('signs the exact raw body and sends forms url-encoded', async () => {
+		const { shopify } = await import('./signatures')
+		const signed = defineWebhook(
+			{
+				method: 'POST',
+				path: '/sms',
+				bodyType: 'form',
+				verify: shopify.verify('s3cret'),
+				body: z.object({ Body: z.string() })
+			},
+			({ body }) => body.Body
+		)
+		const ok = await testWebhook(signed, {
+			body: { Body: 'hi there' },
+			sign: (raw) => shopify.sign(raw, 's3cret')
+		})
+		expect(await ok.text()).toBe('hi there')
+		expect((await testWebhook(signed, { body: { Body: 'x' } })).status).toBe(
+			401
+		)
 	})
 })

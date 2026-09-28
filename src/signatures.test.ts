@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { createWebhooks, defineWebhook, type WebhookEvent } from './index'
-import { github, hmac, shopify, stripe } from './signatures'
+import { github, hmac, shopify, stripe, svix } from './signatures'
 
 const secret = "It's a Secret to Everybody"
 const payload = 'Hello, World!'
@@ -73,6 +73,45 @@ describe('stripe', () => {
 		expect(
 			await check(stripe.verify(secret), { 'stripe-signature': rotated })
 		).toBe(true)
+	})
+})
+
+describe('svix', () => {
+	// Example from the Svix docs.
+	const svixSecret = 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw'
+	const svixBody = '{"test": 2432232314}'
+	const docs = { id: 'msg_p5jXN8AQM9LWM0D4loKWxJek', timestamp: 1614265330 }
+	const forever = { toleranceSeconds: Number.POSITIVE_INFINITY }
+
+	test("matches Svix's documented example", async () => {
+		const headers = await svix.sign(svixBody, svixSecret, docs)
+		expect(headers['svix-signature']).toBe(
+			'v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE='
+		)
+		expect(
+			await check(svix.verify(svixSecret, forever), headers, svixBody)
+		).toBe(true)
+		expect(await check(svix.verify(svixSecret), headers, svixBody)).toBe(false)
+	})
+
+	test('accepts any v1 in the list and Standard Webhooks headers', async () => {
+		const headers = await svix.sign(payload, svixSecret)
+		const rotated = {
+			'webhook-id': headers['svix-id'] ?? '',
+			'webhook-timestamp': headers['svix-timestamp'] ?? '',
+			'webhook-signature': `v1,AAAA ${headers['svix-signature']}`
+		}
+		expect(await check(svix.verify(svixSecret), rotated)).toBe(true)
+		expect(
+			await check(svix.verify(svixSecret), {
+				...headers,
+				'svix-id': 'msg_other'
+			})
+		).toBe(false)
+	})
+
+	test('rejects a secret that is not whsec_<base64>', async () => {
+		await expect(svix.sign(payload, 'whsec_')).rejects.toThrow('whsec_')
 	})
 })
 

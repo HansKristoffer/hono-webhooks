@@ -27,18 +27,27 @@ export interface HmacOptions {
 
 const encoder = new TextEncoder()
 
-function hmacKey(secret: string, hash: string) {
-	if (!secret) throw new Error('hono-webhooks: the signing secret is empty')
+/** A string secret is used as UTF-8; bytes are used as is. */
+function hmacKey(secret: string | Uint8Array, hash: string) {
+	if (!secret.length) {
+		throw new Error('hono-webhooks: the signing secret is empty')
+	}
 	return crypto.subtle.importKey(
 		'raw',
-		encoder.encode(secret),
+		(typeof secret === 'string'
+			? encoder.encode(secret)
+			: secret) as Uint8Array<ArrayBuffer>,
 		{ name: 'HMAC', hash },
 		false,
 		['sign', 'verify']
 	)
 }
 
-async function hmacSign(secret: string, payload: string, hash = 'SHA-256') {
+async function hmacSign(
+	secret: string | Uint8Array,
+	payload: string,
+	hash = 'SHA-256'
+) {
 	const key = await hmacKey(secret, hash)
 	return new Uint8Array(
 		await crypto.subtle.sign('HMAC', key, encoder.encode(payload))
@@ -47,7 +56,7 @@ async function hmacSign(secret: string, payload: string, hash = 'SHA-256') {
 
 /** `crypto.subtle.verify` compares in constant time. */
 async function hmacVerify(
-	secret: string,
+	secret: string | Uint8Array,
 	payload: string,
 	signature: Uint8Array,
 	hash = 'SHA-256'
@@ -167,5 +176,65 @@ export const stripe: SignatureScheme<
 		const t = timestamp ?? Math.floor(Date.now() / 1000)
 		const signature = await hmacSign(secret, `${t}.${rawBody}`)
 		return { 'stripe-signature': `t=${t},v1=${toHex(signature)}` }
+	}
+}
+
+/** Svix secrets are `whsec_` followed by the base64 key. */
+function svixKey(secret: string) {
+	const key = fromBase64(secret.replace(/^whsec_/, ''))
+	if (!key?.length) {
+		throw new Error('hono-webhooks: the Svix secret must be whsec_<base64>')
+	}
+	return key
+}
+
+/**
+ * Svix and Standard Webhooks (Resend, Clerk, ...): `svix-id`,
+ * `svix-timestamp` and `svix-signature: v1,<base64> v1,<base64>`, signed over
+ * `<id>.<timestamp>.<body>` with the base64 key in a `whsec_` secret. The
+ * `webhook-*` header names of Standard Webhooks work too. Rejects timestamps
+ * more than `toleranceSeconds` (default 300) away.
+ */
+export const svix: SignatureScheme<
+	{ toleranceSeconds?: number },
+	{ id?: string; timestamp?: number }
+> = {
+	verify:
+		(secret, { toleranceSeconds = 300 } = {}) =>
+		async ({ c, rawBody, headers }) => {
+			const prefix = headers['svix-id'] ? 'svix' : 'webhook'
+			const id = headers[`${prefix}-id`]
+			const timestamp = headers[`${prefix}-timestamp`] ?? ''
+			const signatures = headers[`${prefix}-signature`]
+			if (!id || !signatures || !/^\d+$/.test(timestamp)) return false
+			if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSeconds) {
+				return false
+			}
+			const key = svixKey(await resolveSecret(secret, c))
+			for (const entry of signatures.split(' ')) {
+				const [version, encoded] = entry.split(',')
+				const signature =
+					version === 'v1' && encoded ? fromBase64(encoded) : undefined
+				if (
+					signature &&
+					(await hmacVerify(key, `${id}.${timestamp}.${rawBody}`, signature))
+				) {
+					return true
+				}
+			}
+			return false
+		},
+	async sign(rawBody, secret, { id, timestamp } = {}) {
+		const msgId = id ?? `msg_${crypto.randomUUID().replaceAll('-', '')}`
+		const t = timestamp ?? Math.floor(Date.now() / 1000)
+		const signature = await hmacSign(
+			svixKey(secret),
+			`${msgId}.${t}.${rawBody}`
+		)
+		return {
+			'svix-id': msgId,
+			'svix-timestamp': String(t),
+			'svix-signature': `v1,${toBase64(signature)}`
+		}
 	}
 }

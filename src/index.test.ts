@@ -596,3 +596,53 @@ export const typeChecks = [
 		() => {}
 	)
 ]
+
+describe('around', () => {
+	test('wraps matched, invalid, 404 and 405 requests with the route known', async () => {
+		const seen: string[] = []
+		const typed = defineWebhook(
+			{ method: 'POST', path: '/typed/:id', body: z.object({ a: z.string() }) },
+			() => ({})
+		)
+		const app = mount([typed], {
+			around: async ({ route, method }, next) => {
+				const res = await next()
+				seen.push(`${method} ${route} ${res.status}`)
+				return res
+			}
+		})
+		await app.request('/webhooks/typed/1', post({ a: 'x' }))
+		await app.request('/webhooks/typed/1', post({}))
+		await app.request('/webhooks/typed/1')
+		await app.request('/webhooks/nope')
+		expect(seen).toEqual([
+			'POST /typed/:id 200',
+			'POST /typed/:id 400',
+			'GET /typed/:id 405',
+			'GET undefined 404'
+		])
+	})
+
+	test('onEvent runs inside around and the async context', async () => {
+		const { AsyncLocalStorage } = await import('node:async_hooks')
+		const store = new AsyncLocalStorage<string>()
+		const inEvent: (string | undefined)[] = []
+		const app = mount([health], {
+			around: ({ route }, next) => store.run(`span ${route}`, next),
+			onEvent: () => void inEvent.push(store.getStore())
+		})
+		await app.request('/webhooks/health')
+		expect(inEvent).toEqual(['span /health'])
+	})
+
+	test('can answer without calling next', async () => {
+		const { events, onEvent } = collectEvents()
+		const app = mount([health], {
+			around: async ({ c }) => c.json({ paused: true }, 503),
+			onEvent
+		})
+		const res = await app.request('/webhooks/health')
+		expect(res.status).toBe(503)
+		expect(events).toHaveLength(0)
+	})
+})

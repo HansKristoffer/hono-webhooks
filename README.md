@@ -387,7 +387,7 @@ summarizeEvent(event)
 //   ip: '203.0.113.9',               // x-forwarded-for, x-real-ip or cf-connecting-ip
 //   userAgent: 'Shopify-Captain-Hook',
 //   params: { id: '42' }, query: {}, body: null, response: null,
-//   error: null,                     // or { name, message, stack }
+//   error: null,                     // or { name, message, stack }; null when validation is set
 //   validation: {
 //     target: 'body',
 //     message: 'total: Expected number',

@@ -731,6 +731,7 @@ describe('events', () => {
 				issues: [{ path: 'total', message: expect.any(String) }]
 			}
 		})
+		expect(invalid?.error).toBeNull()
 		expect(JSON.stringify(invalid)).not.toContain('secret')
 		expect(failed?.error).toMatchObject({
 			name: 'TypeError',

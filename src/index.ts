@@ -557,6 +557,7 @@ export interface WebhookEventSummary {
 	query: Record<string, unknown> | null
 	body: unknown
 	response: unknown
+	/** `null` for validation failures, which `validation` describes. */
 	error: { name: string; message: string; stack: string | null } | null
 	validation: {
 		target: ValidationTarget
@@ -591,8 +592,10 @@ export function summarizeEvent(event: WebhookEvent): WebhookEventSummary {
 		query: event.query ?? null,
 		body: event.body ?? null,
 		response: event.response ?? null,
+		// A validation failure is described by `validation`; its error adds only
+		// a library stack trace.
 		error:
-			error === undefined
+			error === undefined || error instanceof WebhookValidationError
 				? null
 				: error instanceof Error
 					? {

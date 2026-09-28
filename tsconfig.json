@@ -24,5 +24,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // scripts/ imports the built dist, which does not exist before build.
+  "include": ["src"]
 }

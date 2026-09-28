@@ -1,6 +1,7 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import { type Context, type Env, Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { basePath } from 'hono/route'
 import type { ParamKeys, ParamKeyToRecord } from 'hono/types'
 
 export type { StandardSchemaV1 }
@@ -150,14 +151,21 @@ export interface WebhookEvent<E extends Env = any> {
 	/** The matched path pattern, e.g. `/users/:id`. `undefined` for a 404. */
 	route: string | undefined
 	method: string
-	/** The requested path. */
+	/**
+	 * The requested path relative to the mount point, e.g. `/orders/42`. The
+	 * full path is `c.req.path`.
+	 */
 	path: string
 	status: number
+	/** Fractional milliseconds from `performance.now()`. */
 	durationMs: number
-	/** Each part is set once it has been validated. */
-	params?: unknown
-	query?: unknown
-	headers?: unknown
+	/**
+	 * Each part is set once it has been validated: the schema's output, or
+	 * the raw string record when there is no schema.
+	 */
+	params?: Record<string, unknown>
+	query?: Record<string, unknown>
+	headers?: Record<string, unknown>
 	body?: unknown
 	rawBody?: string
 	/** What the handler returned, unless it returned a `Response`. */
@@ -204,6 +212,12 @@ export interface WebhooksOptions<E extends Env = any> {
 	 * and `500 { error: 'Internal Server Error' }` for anything else.
 	 */
 	onError?: (error: unknown, c: Context<E>) => MaybePromise<Response | void>
+	/**
+	 * Log unexpected errors with `console.error` when the default 500
+	 * response is used. Turn off when `onEvent` already logs them.
+	 * @default true
+	 */
+	logErrors?: boolean
 }
 
 export type WebhooksApp<E extends Env = any> = Hono<E> & {
@@ -325,11 +339,13 @@ function makeCreateWebhooks<E extends Env>() {
 		const handle = (route: string | undefined, run: Run) => {
 			const execute = async (c: Context<E>) => {
 				const start = performance.now()
+				const base = basePath(c)
 				const event: WebhookEvent<E> = {
 					c,
 					route,
 					method: c.req.method,
-					path: c.req.path,
+					path:
+						base === '/' ? c.req.path : c.req.path.slice(base.length) || '/',
 					status: 0,
 					durationMs: 0
 				}
@@ -343,7 +359,7 @@ function makeCreateWebhooks<E extends Env>() {
 					}
 					res =
 						(await options.onError?.(error, c)) ??
-						defaultErrorResponse(error, c as Context, !options.onError)
+						defaultErrorResponse(error, c as Context, options.logErrors ?? true)
 				}
 				event.status = res.status
 				event.durationMs = performance.now() - start
@@ -369,9 +385,22 @@ function makeCreateWebhooks<E extends Env>() {
 				config.method,
 				config.path,
 				handle(config.path, async (c, event) => {
-					event.params = await parse(config.params, c.req.param(), 'params')
-					event.query = await parse(config.query, c.req.query(), 'query')
-					event.headers = await parse(config.headers, c.req.header(), 'headers')
+					type Parts = Record<string, unknown>
+					event.params = (await parse(
+						config.params,
+						c.req.param(),
+						'params'
+					)) as Parts
+					event.query = (await parse(
+						config.query,
+						c.req.query(),
+						'query'
+					)) as Parts
+					event.headers = (await parse(
+						config.headers,
+						c.req.header(),
+						'headers'
+					)) as Parts
 					event.rawBody = await c.req.text()
 					if (
 						config.verify &&
@@ -479,5 +508,99 @@ export function createWebhookFactory<E extends Env = any>() {
 	return {
 		defineWebhook: makeDefineWebhook<E>(),
 		createWebhooks: makeCreateWebhooks<E>()
+	}
+}
+
+/**
+ * Validation issues as one line: `total: Expected number; items.0.id: Required`.
+ */
+export function formatIssues(issues: readonly StandardSchemaV1.Issue[]) {
+	return issues
+		.map((issue) => {
+			const path = issuePath(issue)
+			return path ? `${path}: ${issue.message}` : issue.message
+		})
+		.join('; ')
+}
+
+function issuePath(issue: StandardSchemaV1.Issue) {
+	const path = issue.path
+		?.map((segment) =>
+			String(typeof segment === 'object' ? segment.key : segment)
+		)
+		.join('.')
+	return path || null
+}
+
+/** A flat, JSON-safe record of a `WebhookEvent`, ready to log or store. */
+export interface WebhookEventSummary {
+	route: string | null
+	method: string
+	/** Relative to the mount point. */
+	path: string
+	status: number
+	/** Rounded to two decimals. */
+	durationMs: number
+	/** From `x-forwarded-for`, `x-real-ip` or `cf-connecting-ip`; clients can spoof these. */
+	ip: string | null
+	userAgent: string | null
+	params: Record<string, unknown> | null
+	query: Record<string, unknown> | null
+	body: unknown
+	response: unknown
+	error: { name: string; message: string; stack: string | null } | null
+	validation: {
+		target: ValidationTarget
+		/** `formatIssues(issues)` */
+		message: string
+		issues: { message: string; path: string | null }[]
+	} | null
+}
+
+/**
+ * Flattens an event for logging or storage. Request headers are left out on
+ * purpose: they carry signatures and credentials.
+ *
+ * @example
+ * onEvent: (e) => db.insert(webhookCalls).values(summarizeEvent(e))
+ */
+export function summarizeEvent(event: WebhookEvent): WebhookEventSummary {
+	const { c, error, validation } = event
+	return {
+		route: event.route ?? null,
+		method: event.method,
+		path: event.path,
+		status: event.status,
+		durationMs: Math.round(event.durationMs * 100) / 100,
+		ip:
+			c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ||
+			c.req.header('x-real-ip') ||
+			c.req.header('cf-connecting-ip') ||
+			null,
+		userAgent: c.req.header('user-agent') ?? null,
+		params: event.params ?? null,
+		query: event.query ?? null,
+		body: event.body ?? null,
+		response: event.response ?? null,
+		error:
+			error === undefined
+				? null
+				: error instanceof Error
+					? {
+							name: error.name,
+							message: error.message,
+							stack: error.stack ?? null
+						}
+					: { name: 'Error', message: String(error), stack: null },
+		validation: validation
+			? {
+					target: validation.target,
+					message: formatIssues(validation.issues),
+					issues: validation.issues.map((issue) => ({
+						message: issue.message,
+						path: issuePath(issue)
+					}))
+				}
+			: null
 	}
 }

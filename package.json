@@ -65,7 +65,7 @@
     "@standard-schema/spec": "^1.1.0"
   },
   "peerDependencies": {
-    "hono": "^4.6.0"
+    "hono": "^4.8.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",

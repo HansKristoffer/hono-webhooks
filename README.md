@@ -735,14 +735,19 @@ bunx hono-webhooks ./src/webhooks/index.ts test POST /shopify/orders -b '{"id":1
 - `test` sends a real request through the webhooks app (without the parent
   app's middleware) and exits with code 1 on a 4xx or 5xx response.
 - `--preload` imports modules in order, before the webhooks module. It takes
-  a file path or a package name, and works the same under Bun and Node.
+  a file path or a package name.
 - `--sign` signs the exact `--body` with the secret read from the environment
   variable named by `--secret-env`, after preloading, so a preloaded module
   can set it.
 - `schema` prints the JSON Schemas from
   [`describeWebhooks`](#describing-webhooks).
-- The CLI imports your TypeScript file. That works under Bun, and under Node
-  22.18+ which strips types natively.
+- The CLI imports your TypeScript file. `bunx hono-webhooks` starts the CLI
+  under Node (its shebang is `node`), and Node 22.18+ can load plain
+  TypeScript. It can't load everything Bun can, such as extensionless
+  imports (`import { x } from './x'`). When Node fails to load your module
+  and Bun is installed, the CLI reruns the same command under Bun
+  automatically. To skip the failed Node attempt in a Bun project, run
+  `bunx --bun hono-webhooks ...`.
 
 ## API reference
 

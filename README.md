@@ -212,14 +212,15 @@ When `verify` returns `false`, the answer is
 | `github`                                | `x-hub-signature-256: sha256=<hex>`     | body                |
 | `shopify`                               | `x-shopify-hmac-sha256: <base64>`       | body                |
 | `stripe`                                | `stripe-signature: t=<unix>,v1=<hex>`   | `<t>.<body>`        |
+| `svix` (Resend, Clerk, Standard Webhooks) | `svix-id`, `svix-timestamp`, `svix-signature: v1,<base64> ...` (or `webhook-*`) | `<id>.<timestamp>.<body>`, key from `whsec_<base64>` |
 | `hmac({ header, encoding, prefix?, hash? })` | any header, hex or base64, SHA-1/256/512 | body          |
 
 - `scheme.verify(secret)` gives a `verify` function. `secret` is a string or
   `(c) => string | Promise<string>`, so it can come from `c.env`. An empty
   secret throws (a 500), instead of silently accepting or rejecting everything.
-- `stripe.verify(secret, { toleranceSeconds })` also rejects timestamps more
-  than 300 seconds away by default, and accepts any matching `v1` so secret
-  rotation works.
+- `stripe.verify(secret, { toleranceSeconds })` and `svix.verify(...)` also
+  reject timestamps more than 300 seconds away by default, and accept any
+  matching `v1` so secret rotation works.
 - `scheme.sign(rawBody, secret)` returns the headers the provider would send,
   for tests and the CLI.
 - Signatures are compared with `crypto.subtle.verify`, which runs in constant
@@ -487,6 +488,27 @@ export const githubPush = defineWebhook(
 )
 ```
 
+### Resend (Svix) events
+
+```ts
+import { svix } from 'hono-webhooks/signatures'
+
+export const resendEvents = defineWebhook(
+	{
+		method: 'POST',
+		path: '/resend',
+		verify: svix.verify((c) => c.env.RESEND_WEBHOOK_SECRET), // whsec_...
+		body: z.object({
+			type: z.string(),
+			data: z.object({ email_id: z.string() })
+		})
+	},
+	({ body }) => {
+		if (body.type === 'email.bounced') markBounced(body.data.email_id)
+	}
+)
+```
+
 ### Twilio form posts
 
 ```ts
@@ -692,7 +714,7 @@ Options for test:
   -b, --body <text>         Request body (JSON sets content-type: application/json)
   -q, --query <params>      Query string, e.g. "a=1&b=2"
   -H, --header <k: v>       Request header, repeatable
-  -s, --sign <scheme>       Sign the body: github, shopify, stripe
+  -s, --sign <scheme>       Sign the body: github, shopify, stripe, svix
   -e, --secret-env <name>   Environment variable holding the signing secret
 ```
 
@@ -739,7 +761,8 @@ import {
 import {
 	github,
 	shopify,
-	stripe, // each: .verify(secret, options?) and .sign(rawBody, secret, options?)
+	stripe,
+	svix, // each: .verify(secret, options?) and .sign(rawBody, secret, options?)
 	hmac // (options) => a scheme like the ones above
 } from 'hono-webhooks/signatures'
 

@@ -9,12 +9,19 @@ import {
 	type Webhook,
 	type WebhooksApp
 } from './index'
-import { github, type SignatureScheme, shopify, stripe } from './signatures'
+import {
+	github,
+	type SignatureScheme,
+	shopify,
+	stripe,
+	svix
+} from './signatures'
 
 const schemes: Record<string, SignatureScheme<any, any>> = {
 	github,
 	shopify,
-	stripe
+	stripe,
+	svix
 }
 
 const HELP = `Usage: hono-webhooks <module> <command> [options]

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.3.0...v0.4.0) (2026-10-20)
+
+
+### Features
+
+* hono-webhooks/otel subpath with spans and metrics ([#14](https://github.com/HansKristoffer/hono-webhooks/issues/14)) ([6f018c6](https://github.com/HansKristoffer/hono-webhooks/commit/6f018c6f89be3de8ec3d50fac45e2abf846bc4ff))
+
 ## [0.3.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.2.0...v0.3.0) (2026-09-28)
 
 

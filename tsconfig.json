@@ -12,6 +12,9 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
+    // src/otel.ts imports the main entry by name so the build keeps one copy
+    // of it; the `bun` export condition points the name at the source.
+    "customConditions": ["bun"],
 
     // Best practices
     "strict": true,

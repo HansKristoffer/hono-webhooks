@@ -25,7 +25,8 @@
     "valibot",
     "arktype",
     "typescript",
-    "type-safe"
+    "type-safe",
+    "opentelemetry"
   ],
   "files": [
     "src/**/*.ts",
@@ -48,11 +49,17 @@
       "bun": "./src/signatures.ts",
       "import": "./dist/signatures.js",
       "default": "./dist/signatures.js"
+    },
+    "./otel": {
+      "types": "./dist/otel.d.ts",
+      "bun": "./src/otel.ts",
+      "import": "./dist/otel.js",
+      "default": "./dist/otel.js"
     }
   },
   "scripts": {
     "build": "rm -rf dist && bun run build:js && bun run build:types",
-    "build:js": "bun build ./src/index.ts ./src/signatures.ts ./src/cli.ts --outdir ./dist --target node --packages external",
+    "build:js": "bun build ./src/index.ts ./src/signatures.ts ./src/otel.ts ./src/cli.ts --outdir ./dist --target node --packages external",
     "build:types": "tsgo -p tsconfig.build.json",
     "prepublishOnly": "bun run build",
     "test": "bun test",
@@ -65,10 +72,19 @@
     "@standard-schema/spec": "^1.1.0"
   },
   "peerDependencies": {
-    "hono": "^4.8.0"
+    "hono": "^4.8.0",
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentelemetry/api": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/sdk-metrics": "^2.12.0",
+    "@opentelemetry/sdk-trace-base": "^2.12.0",
     "@types/bun": "^1.4.2",
     "@typescript/native-preview": "^7.0.0-dev.20260707.2",
     "hono": "^4.13.10",

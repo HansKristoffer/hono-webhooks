@@ -1,6 +1,4 @@
 import {
-	type Counter,
-	type Histogram,
 	type Meter,
 	metrics,
 	type Span,
@@ -9,7 +7,7 @@ import {
 	type Tracer,
 	trace
 } from '@opentelemetry/api'
-import type { Context } from 'hono'
+import type { Context, Env } from 'hono'
 import {
 	summarizeEvent,
 	type WebhookEvent,
@@ -20,7 +18,7 @@ import {
 /** The `route` label for 404s, which match no webhook. */
 export const UNMATCHED_ROUTE = '__unmatched__'
 
-export interface OtelWebhooksOptions {
+export interface OtelWebhooksOptions<E extends Env = any> {
 	/** @default trace.getTracer('webhooks') */
 	tracer?: Tracer
 	/** @default metrics.getMeter('webhooks'), resolved on the first request */
@@ -34,7 +32,7 @@ export interface OtelWebhooksOptions {
 	 */
 	onWebhookCall?: (
 		call: WebhookEventSummary,
-		event: WebhookEvent
+		event: WebhookEvent<E>
 	) => void | Promise<void>
 }
 
@@ -43,18 +41,21 @@ export interface OtelWebhooksOptions {
  * `webhook_request_total` and `webhook_request_duration_ms` by route and
  * outcome.
  *
+ * With `createWebhookFactory<AppEnv>()`, call `otelWebhooks<AppEnv>(...)`
+ * so `onWebhookCall` gets a typed context.
+ *
  * @example
  * createWebhooks(webhooks, { ...otelWebhooks({ ignoreRoutes: ['/health'] }), logErrors: false })
  */
-export function otelWebhooks(
-	options: OtelWebhooksOptions = {}
-): Required<Pick<WebhooksOptions, 'around' | 'onEvent'>> {
+export function otelWebhooks<E extends Env = any>(
+	options: OtelWebhooksOptions<E> = {}
+): Required<Pick<WebhooksOptions<E>, 'around' | 'onEvent'>> {
 	const tracer = options.tracer ?? trace.getTracer('webhooks')
 	const ignored = new Set(options.ignoreRoutes)
 	// The span is looked up by context, so it is found even without an OTel
 	// context manager.
 	const spans = new WeakMap<Context, Span>()
-	let instruments: { total: Counter; duration: Histogram } | undefined
+	let instruments: ReturnType<typeof createInstruments> | undefined
 
 	return {
 		around: ({ c, route, method }, next) => {

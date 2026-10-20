@@ -1,8 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { SpanKind, SpanStatusCode } from '@opentelemetry/api'
 import {
-	type DataPoint,
-	type Histogram,
+	DataPointType,
 	MeterProvider,
 	MetricReader
 } from '@opentelemetry/sdk-metrics'
@@ -61,19 +60,32 @@ const setup = (options: Omit<OtelWebhooksOptions, 'tracer' | 'meter'> = {}) => {
 	const metrics = async () => {
 		const { resourceMetrics } = await reader.collect()
 		const all = resourceMetrics.scopeMetrics.flatMap((s) => s.metrics)
-		const points = (name: string) =>
-			all.find((m) => m.descriptor.name === name)?.dataPoints ?? []
+		const total = all.find((m) => m.descriptor.name === 'webhook_request_total')
+		const durations = all.find(
+			(m) => m.descriptor.name === 'webhook_request_duration_ms'
+		)
+
 		return {
-			total: (points('webhook_request_total') as DataPoint<number>[]).map(
-				({ attributes: { route, status }, value }) => ({ route, status, value })
-			),
-			durations: (
-				points('webhook_request_duration_ms') as DataPoint<Histogram>[]
-			).map(({ attributes: { route, status }, value }) => ({
-				route,
-				status,
-				count: value.count
-			}))
+			total:
+				total?.dataPointType === DataPointType.SUM
+					? total.dataPoints.map(
+							({ attributes: { route, status }, value }) => ({
+								route,
+								status,
+								value
+							})
+						)
+					: [],
+			durations:
+				durations?.dataPointType === DataPointType.HISTOGRAM
+					? durations.dataPoints.map(
+							({ attributes: { route, status }, value }) => ({
+								route,
+								status,
+								count: value.count
+							})
+						)
+					: []
 		}
 	}
 

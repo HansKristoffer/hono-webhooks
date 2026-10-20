@@ -545,62 +545,46 @@ createWebhooks(webhooks, {
 })
 ```
 
-### OpenTelemetry metrics
+### OpenTelemetry
+
+`hono-webhooks/otel` puts each request in a server span and records two
+metrics. It needs `@opentelemetry/api` (an optional peer dependency):
+
+```bash
+bun add @opentelemetry/api
+```
 
 ```ts
-import { metrics } from '@opentelemetry/api'
-
-const duration = metrics.getMeter('webhooks').createHistogram('webhook.duration', { unit: 'ms' })
+import { otelWebhooks } from 'hono-webhooks/otel'
 
 createWebhooks(webhooks, {
-	onEvent: (e) =>
-		duration.record(e.durationMs, {
-			'http.route': e.route ?? 'unmatched',
-			'http.request.method': e.method,
-			'http.response.status_code': e.status
-		})
+	...otelWebhooks({
+		ignoreRoutes: ['/health'],
+		onWebhookCall(call, event) {
+			// `call` is summarizeEvent(event); the request's span is active here
+			logger.info('webhook.completed', { route: call.route, status: call.status })
+		}
+	}),
+	// onWebhookCall logs errors with the route and span
+	logErrors: false
 })
 ```
 
-### OpenTelemetry traces
+- **Span** `webhook: POST /orders/:id` (kind `SERVER`) with `http.method`,
+  `http.route`, `http.status_code`, `webhook.duration_ms`, `webhook.success`
+  and, for validation failures, `webhook.validation_error`. Status is `ERROR`
+  for 4xx and 5xx; 5xx errors are recorded as exceptions. Spans created in
+  handlers nest under it when an OTel context manager is registered.
+- **Metrics** `webhook_request_total` (counter) and
+  `webhook_request_duration_ms` (histogram, ms), both by `route` (the pattern,
+  `__unmatched__` for a 404) and `status` (`success` below 400, else `failed`).
+- `ignoreRoutes` skips metrics only; the span and `onWebhookCall` still run.
+- `tracer` and `meter` default to `trace.getTracer('webhooks')` and
+  `metrics.getMeter('webhooks')`. The meter is resolved on the first request,
+  so registering the SDK after import works.
 
-One span per request, named by the route pattern (low cardinality), with
-`onEvent` logs attached to it:
-
-```ts
-import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api'
-
-const tracer = trace.getTracer('webhooks')
-
-createWebhooks(webhooks, {
-	around: ({ c, route, method }, next) =>
-		tracer.startActiveSpan(
-			`webhook ${method} ${route ?? 'unmatched'}`,
-			{
-				kind: SpanKind.SERVER,
-				attributes: {
-					'http.request.method': method,
-					'http.route': route ?? 'unmatched',
-					'url.path': c.req.path
-				}
-			},
-			async (span) => {
-				try {
-					const res = await next()
-					span.setAttribute('http.response.status_code', res.status)
-					if (res.status >= 500) span.setStatus({ code: SpanStatusCode.ERROR })
-					return res
-				} finally {
-					span.end()
-				}
-			}
-		),
-	onEvent: (e) => {
-		// trace.getActiveSpan() is the span above
-		if (e.error instanceof Error) trace.getActiveSpan()?.recordException(e.error)
-	}
-})
-```
+It returns `{ around, onEvent }`. To add your own, call them from yours, or
+use `onWebhookCall` instead of `onEvent`.
 
 ### Skipping noise
 
@@ -771,6 +755,11 @@ import {
 	hmac // (options) => a scheme like the ones above
 } from 'hono-webhooks/signatures'
 
+import {
+	otelWebhooks, // (options?) => { around, onEvent } with spans and metrics
+	UNMATCHED_ROUTE // '__unmatched__', the route label for 404s
+} from 'hono-webhooks/otel'
+
 import type {
 	Webhook,
 	WebhookConfig,
@@ -791,6 +780,8 @@ import type {
 	PathParams,
 	StandardSchemaV1
 } from 'hono-webhooks'
+
+import type { OtelWebhooksOptions } from 'hono-webhooks/otel'
 ```
 
 Use `Webhook` to type a list: `const all: Webhook<AppEnv>[] = [a, b]`.

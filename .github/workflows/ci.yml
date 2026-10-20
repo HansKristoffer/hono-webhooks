@@ -32,6 +32,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun test
       - run: bun run build
+      # The otel entry imports the main entry by name; it must resolve to dist.
+      - run: node -e "import('hono-webhooks/otel').then((m) => m.otelWebhooks())"
       # Runs the built CLI and package under Node against a fixture app.
       - run: node dist/cli.js scripts/fixture-webhooks.ts test GET /health
       - run: >-

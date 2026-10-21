@@ -37,43 +37,113 @@ const self = import.meta.path
 
 test('help', async () => {
 	const help = await run('--help')
-	expect(help.code).toBe(0)
-	expect(
-		help.stdout
-	).toBe(`Usage: hono-webhooks [module] [command] <args...> [options]
-
+	expect(help).toEqual({
+		code: 0,
+		stdout: `hono-webhooks
 <module> exports a createWebhooks() app or an array of webhooks, as default
 or named export.
 
-Commands:
-  list                  List the webhooks
-  schema <path>         Print the JSON Schemas of the webhooks at <path>
-  test <method> <path>  Send a request through the webhooks app
-
-Examples:
-  hono-webhooks ./src/webhooks.ts list
-  hono-webhooks ./src/webhooks.ts schema /orders/:id
-  hono-webhooks ./src/webhooks.ts test POST /orders/42 -b '{"total":10}'
-  hono-webhooks ./src/webhooks.ts test POST /shopify -b '{"id":1}' \\
-    -r ./src/secrets.ts --sign shopify --secret-env SHOPIFY_WEBHOOK_SECRET
+Usage: hono-webhooks <module> <command> [options]
 
 Arguments:
-  [module]   Module with the webhooks
-  [command]  list, schema or test
-  <args...>  schema: <path>, test: <method> <path>
+  <module>  Module with the webhooks
+
+Commands:
+  list                   List the webhooks
+  schema                 Print the JSON Schemas of the webhooks at <path>
+  test                   Send a request through the webhooks app
+  completion <bash|zsh>  Print a shell completion script
 
 Options:
   -r, --preload <string>...  Import a module first (e.g. to load secrets), repeatable
-  -b, --body <string>        test: request body (JSON sets content-type: application/json)
-  -q, --query <string>       test: query string, e.g. "a=1&b=2"
-  -H, --header <string>...   test: request header "name: value", repeatable
-  -s, --sign <string>        test: sign the body with github, shopify, stripe, svix
-  -e, --secret-env <string>  test: environment variable holding the signing secret
   -h, --help                 Show help
-`)
-	// No module or command prints the same help and succeeds.
+
+Run "hono-webhooks <module> <command> --help" for a command's options.
+`,
+		stderr: ''
+	})
+	// No module or no command prints the same help and succeeds.
+	expect(await run()).toEqual(help)
 	expect(await run(self)).toEqual(help)
-	expect(await run(self, 'list', '--help')).toEqual(help)
+})
+
+test('list --help', async () => {
+	expect(await run(self, 'list', '--help')).toEqual({
+		code: 0,
+		stdout: `Usage: hono-webhooks <module> list [options]
+
+List the webhooks
+
+Arguments:
+  <module>  Module with the webhooks
+
+Options:
+  -h, --help  Show help
+
+Global options:
+  -r, --preload <string>...  Import a module first (e.g. to load secrets), repeatable
+
+Examples:
+  hono-webhooks ./src/webhooks.ts list
+`,
+		stderr: ''
+	})
+})
+
+test('schema --help', async () => {
+	expect(await run(self, 'schema', '--help')).toEqual({
+		code: 0,
+		stdout: `Usage: hono-webhooks <module> schema <path> [options]
+
+Print the JSON Schemas of the webhooks at <path>
+
+Arguments:
+  <module>  Module with the webhooks
+  <path>    Webhook path
+
+Options:
+  -h, --help  Show help
+
+Global options:
+  -r, --preload <string>...  Import a module first (e.g. to load secrets), repeatable
+
+Examples:
+  hono-webhooks ./src/webhooks.ts schema /orders/:id
+`,
+		stderr: ''
+	})
+})
+
+test('test --help', async () => {
+	expect(await run(self, 'test', '--help')).toEqual({
+		code: 0,
+		stdout: `Usage: hono-webhooks <module> test <method> <path> [options]
+
+Send a request through the webhooks app
+
+Arguments:
+  <module>  Module with the webhooks
+  <method>  HTTP method, e.g. POST
+  <path>    Request path
+
+Options:
+  -b, --body <string>        Request body (JSON sets content-type: application/json)
+  -q, --query <string>       Query string, e.g. "a=1&b=2"
+  -H, --header <string>...   Request header "name: value", repeatable
+  -s, --sign <string>        Sign the body: github, shopify, stripe, svix
+  -e, --secret-env <string>  Environment variable holding the signing secret
+  -h, --help                 Show help
+
+Global options:
+  -r, --preload <string>...  Import a module first (e.g. to load secrets), repeatable
+
+Examples:
+  hono-webhooks ./src/webhooks.ts test POST /orders/42 -b '{"total":10}'
+  hono-webhooks ./src/webhooks.ts test POST /shopify -b '{"id":1}' \\
+    -r ./src/secrets.ts --sign shopify --secret-env SHOPIFY_WEBHOOK_SECRET
+`,
+		stderr: ''
+	})
 })
 
 test('list', async () => {

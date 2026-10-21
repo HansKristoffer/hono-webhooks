@@ -560,12 +560,15 @@ import { otelWebhooks } from 'hono-webhooks/otel'
 createWebhooks(webhooks, {
 	...otelWebhooks({
 		ignoreRoutes: ['/health'],
+		// one `webhook.completed` log per request, with the request's span
+		logger: (span) => createLogger({ span }),
 		onWebhookCall(call, event) {
-			// `call` is summarizeEvent(event); the request's span is active here
-			logger.info('webhook.completed', { route: call.route, status: call.status })
+			// `call` is summarizeEvent(event) plus `level` and `outcome`;
+			// the request's span is active here
+			storeCall(call)
 		}
 	}),
-	// onWebhookCall logs errors with the route and span
+	// the completion log carries the error type
 	logErrors: false
 })
 ```
@@ -578,7 +581,23 @@ createWebhooks(webhooks, {
 - **Metrics** `webhook_request_total` (counter) and
   `webhook_request_duration_ms` (histogram, ms), both by `route` (the pattern,
   `__unmatched__` for a 404) and `status` (`success` below 400, else `failed`).
-- `ignoreRoutes` skips metrics only; the span and `onWebhookCall` still run.
+- **Log** `webhook.completed`, when `logger` is set, at `error` for 5xx,
+  `warn` for 4xx and `info` otherwise, with `route`, `method`, `status_code`,
+  `duration_ms`, `status` (`success`, `failed` or `validation_failed`) and
+  `error_type`. `logger` gets the request's span and returns anything with
+  `info`, `warn` and `error` methods taking `(message, fields)`, so
+  `logger: () => console` works. 404s and `ignoreRoutes` are not logged.
+- `ignoreRoutes` skips metrics and the log; the span and `onWebhookCall` still
+  run.
+- `webhookMetrics` describes both metrics (`name`, `kind`, `unit`,
+  `description` and `attributes`, where each attribute maps to its values or
+  `'string'`), so a metric catalog can list them:
+
+  ```ts
+  import { webhookMetrics } from 'hono-webhooks/otel'
+
+  export const otelMetrics = [...appMetrics, ...webhookMetrics]
+  ```
 - `tracer` and `meter` default to `trace.getTracer('webhooks')` and
   `metrics.getMeter('webhooks')`. The meter is resolved on the first request,
   so registering the SDK after import works.
@@ -757,6 +776,7 @@ import {
 
 import {
 	otelWebhooks, // (options?) => { around, onEvent } with spans and metrics
+	webhookMetrics, // the two metric definitions, as data
 	UNMATCHED_ROUTE // '__unmatched__', the route label for 404s
 } from 'hono-webhooks/otel'
 
@@ -781,7 +801,12 @@ import type {
 	StandardSchemaV1
 } from 'hono-webhooks'
 
-import type { OtelWebhooksOptions } from 'hono-webhooks/otel'
+import type {
+	OtelWebhooksOptions,
+	WebhookCall,
+	WebhookLogger,
+	WebhookMetricDefinition
+} from 'hono-webhooks/otel'
 ```
 
 Use `Webhook` to type a list: `const all: Webhook<AppEnv>[] = [a, b]`.

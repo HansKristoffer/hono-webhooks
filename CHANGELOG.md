@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.4.1...v0.5.0) (2026-10-21)
+
+
+### Features
+
+* **otel:** webhookMetrics definitions and a webhook.completed logger ([#18](https://github.com/HansKristoffer/hono-webhooks/issues/18)) ([30634de](https://github.com/HansKristoffer/hono-webhooks/commit/30634de8e8489c1f5b7aa01854afef53bf05e217))
+
 ## [0.4.1](https://github.com/HansKristoffer/hono-webhooks/compare/v0.4.0...v0.4.1) (2026-10-21)
 
 

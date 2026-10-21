@@ -59,7 +59,8 @@
   },
   "scripts": {
     "build": "rm -rf dist && bun run build:js && bun run build:types",
-    "build:js": "bun build ./src/index.ts ./src/signatures.ts ./src/otel.ts ./src/cli.ts --outdir ./dist --target node --packages external",
+    "build:js": "bun build ./src/index.ts ./src/signatures.ts ./src/otel.ts --outdir ./dist --target node --packages external && bun run build:cli",
+    "build:cli": "bun build ./src/cli.ts --outdir ./dist --target node --external hono --external @standard-schema/spec",
     "build:types": "tsgo -p tsconfig.build.json",
     "prepublishOnly": "bun run build",
     "test": "bun test",
@@ -87,6 +88,7 @@
     "@opentelemetry/sdk-trace-base": "^2.12.0",
     "@types/bun": "^1.4.2",
     "@typescript/native-preview": "^7.0.0-dev.20260707.2",
+    "hanzio": "^3.1.0",
     "hono": "^4.13.10",
     "husky": "^9.1.7",
     "typescript": "^7.0.2",

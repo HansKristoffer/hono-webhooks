@@ -721,6 +721,8 @@ Options for test:
   -e, --secret-env <name>   Environment variable holding the signing secret
 ```
 
+`hono-webhooks <module> <command> --help` prints the options of one command.
+
 `<module>` exports either a `createWebhooks()` app or an array of webhooks, as
 default or as any named export. With an array, the CLI builds the app itself,
 so it can point straight at the file that lists your webhooks.

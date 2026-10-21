@@ -1,7 +1,7 @@
 # Runs on every push to main. Release Please opens or updates the release PR;
 # merging that PR creates the v* tag and GitHub release, and this same run then
-# publishes to npm via trusted publishing (OIDC). Tags made by the workflow
-# token do not trigger workflows, so publish runs here instead of on the tag.
+# publishes to npm via trusted publishing (OIDC). No workflow listens for the
+# tag, so publish runs here instead of on the tag.
 #
 # workflow_dispatch skips Release Please and publishes the checked-out main by
 # hand. npm validates the *calling* workflow's filename, so the trusted
@@ -25,8 +25,11 @@ jobs:
     outputs:
       released: ${{ steps.rp.outputs.release_created }}
     steps:
+      # With RELEASE_PLEASE_TOKEN set, the release PR starts CI itself; GITHUB_TOKEN events start no workflows.
       - uses: googleapis/release-please-action@v4
         id: rp
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
   publish-npm:
     needs: release-please
     if: always() && (github.event_name == 'workflow_dispatch' || needs.release-please.outputs.released == 'true')

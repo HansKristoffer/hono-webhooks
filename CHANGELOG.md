@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/HansKristoffer/hono-webhooks/compare/v0.4.0...v0.4.1) (2026-10-21)
+
+
+### Miscellaneous Chores
+
+* release 0.4.1 ([6b6dba8](https://github.com/HansKristoffer/hono-webhooks/commit/6b6dba848272eda887cb1cee92a835b7ab2bfbe8))
+
 ## [0.4.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.3.0...v0.4.0) (2026-10-20)
 
 

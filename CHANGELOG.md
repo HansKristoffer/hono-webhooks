@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/HansKristoffer/hono-webhooks/compare/v0.5.0...v0.5.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **cli:** make list, schema and test real commands ([#20](https://github.com/HansKristoffer/hono-webhooks/issues/20)) ([eed130b](https://github.com/HansKristoffer/hono-webhooks/commit/eed130b7a91dffea01d389954ba0cc25befbc7a9))
+
 ## [0.5.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.4.1...v0.5.0) (2026-10-21)
 
 

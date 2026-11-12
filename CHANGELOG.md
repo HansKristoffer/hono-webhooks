@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0](https://github.com/HansKristoffer/hono-webhooks/compare/v0.5.1...v0.6.0) (2026-11-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* require verify on webhooks, cap body size, add shared-secret, Infisical, Twilio and HubSpot schemes ([#24](https://github.com/HansKristoffer/hono-webhooks/issues/24))
+
+### Features
+
+* require verify on webhooks, cap body size, add shared-secret, Infisical, Twilio and HubSpot schemes ([#24](https://github.com/HansKristoffer/hono-webhooks/issues/24)) ([8853824](https://github.com/HansKristoffer/hono-webhooks/commit/885382455b8ed6b261fd274780a2e51d036fce49))
+
 ## [0.5.1](https://github.com/HansKristoffer/hono-webhooks/compare/v0.5.0...v0.5.1) (2026-10-21)
 
 

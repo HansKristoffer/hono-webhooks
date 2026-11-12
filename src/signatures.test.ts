@@ -1,8 +1,20 @@
 import { describe, expect, test } from 'bun:test'
+import { createHmac } from 'node:crypto'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { createWebhooks, defineWebhook, type WebhookEvent } from './index'
-import { github, hmac, shopify, stripe, svix } from './signatures'
+import {
+	github,
+	hmac,
+	hubspot,
+	infisical,
+	meta,
+	sharedSecret,
+	shopify,
+	stripe,
+	svix,
+	twilio
+} from './signatures'
 
 const secret = "It's a Secret to Everybody"
 const payload = 'Hello, World!'
@@ -11,7 +23,28 @@ const check = (
 	verify: ReturnType<typeof github.verify>,
 	headers: Record<string, string>,
 	rawBody = payload
-) => verify({ c: {} as never, rawBody, headers })
+) => verify({ c: {} as never, rawBody, headers, fail: () => false })
+
+/** The reason a scheme passed to `fail`, or `true`. */
+async function reason(
+	verify: ReturnType<typeof github.verify>,
+	headers: Record<string, string>,
+	rawBody = payload,
+	url = 'https://example.com/hook'
+) {
+	let why: string | undefined
+	const c = { req: { url, method: 'POST' } } as never
+	const ok = await verify({
+		c,
+		rawBody,
+		headers,
+		fail: (r) => {
+			why = r
+			return false
+		}
+	})
+	return ok === true ? true : why
+}
 
 describe('github', () => {
 	test("matches GitHub's documented test vector", async () => {
@@ -185,11 +218,155 @@ describe('verify option', () => {
 		events.length = 0
 		const res = await send('{not json', { 'x-shopify-hmac-sha256': 'AAAA' })
 		expect(res.status).toBe(401)
-		expect(await res.json()).toEqual({
-			error: 'Invalid signature',
-			issues: [{ message: 'Signature does not match' }]
+		// The reason goes to onEvent only.
+		expect(await res.json()).toEqual({ error: 'Invalid signature' })
+		expect(events[0]?.validation).toEqual({
+			target: 'signature',
+			issues: [{ message: 'mismatch' }]
 		})
-		expect(events[0]?.validation?.target).toBe('signature')
 		expect(events[0]?.body).toBeUndefined()
+	})
+})
+
+describe('failure reasons', () => {
+	test('built-in schemes say why they rejected', async () => {
+		const signed = await stripe.sign(payload, secret)
+		expect(await reason(stripe.verify(secret), {})).toBe('missing-header')
+		expect(
+			await reason(stripe.verify(secret), { 'stripe-signature': 'v1=00' })
+		).toBe('malformed')
+		const old = await stripe.sign(payload, secret, { timestamp: 1 })
+		expect(await reason(stripe.verify(secret), old)).toBe(
+			'timestamp-out-of-tolerance'
+		)
+		expect(await reason(stripe.verify('other'), signed)).toBe('mismatch')
+		expect(await reason(stripe.verify(secret), signed)).toBe(true)
+	})
+})
+
+test('meta signs like github', () => {
+	expect(meta).toBe(github)
+})
+
+describe('sharedSecret', () => {
+	const bearer = sharedSecret({ header: 'Authorization', prefix: 'Bearer ' })
+
+	test('accepts the exact secret only', async () => {
+		const headers = await bearer.sign('', 'tok')
+		expect(headers).toEqual({ authorization: 'Bearer tok' })
+		expect(await reason(bearer.verify('tok'), headers)).toBe(true)
+		expect(
+			await reason(bearer.verify('tok'), { authorization: 'Bearer tok2' })
+		).toBe('mismatch')
+		expect(
+			await reason(bearer.verify('tok'), { authorization: 'Basic tok' })
+		).toBe('malformed')
+		expect(await reason(bearer.verify('tok'), {})).toBe('missing-header')
+	})
+
+	test('an unset secret fails closed instead of matching a missing header', async () => {
+		const scheme = sharedSecret({ header: 'x-token' })
+		await expect(check(scheme.verify(''), { 'x-token': '' })).resolves.toBe(
+			false
+		)
+		await expect(check(scheme.verify(''), { 'x-token': 'x' })).rejects.toThrow(
+			'empty'
+		)
+	})
+})
+
+describe('infisical', () => {
+	const body = (timestamp: number) =>
+		JSON.stringify({ event: 'secrets.modified', timestamp })
+
+	test('matches Infisical: hex HMAC of the JSON body, t from the body', async () => {
+		const raw = body(Date.now())
+		const expected = createHmac('sha256', secret).update(raw).digest('hex')
+		const headers = await infisical.sign(raw, secret)
+		expect(headers['x-infisical-signature']).toBe(
+			`t=${JSON.parse(raw).timestamp};${expected}`
+		)
+		expect(await reason(infisical.verify(secret), headers, raw)).toBe(true)
+		expect(await reason(infisical.verify('other'), headers, raw)).toBe(
+			'mismatch'
+		)
+	})
+
+	test('rejects a replayed body even with a fresh header timestamp', async () => {
+		const raw = body(Date.now() - 301_000)
+		const { 'x-infisical-signature': header = '' } = await infisical.sign(
+			raw,
+			secret
+		)
+		const fresh = header.replace(/^t=\d+/, `t=${Date.now()}`)
+		expect(
+			await reason(
+				infisical.verify(secret),
+				{ 'x-infisical-signature': fresh },
+				raw
+			)
+		).toBe('timestamp-out-of-tolerance')
+		expect(
+			await reason(infisical.verify(secret), { 'x-infisical-signature': 'x' })
+		).toBe('malformed')
+	})
+})
+
+describe('twilio', () => {
+	// The example from Twilio's security docs, checked against the Twilio SDK.
+	const url = 'https://mycompany.com/myapp.php?foo=1&bar=2'
+	const form =
+		'CallSid=CA1234567890ABCDE&Caller=%2B12349013030&Digits=1234&From=%2B12349013030&To=%2B18005551212'
+
+	test("matches Twilio's documented example", async () => {
+		const headers = await twilio.sign(form, '12345', { url })
+		expect(headers).toEqual({
+			'x-twilio-signature': '0/KCTR6DLpKmkAf8muzZqo1nDgQ='
+		})
+		expect(
+			await reason(twilio.verify('12345', { url: () => url }), headers, form)
+		).toBe(true)
+	})
+
+	test('checks c.req.url by default and tries every url candidate', async () => {
+		const headers = await twilio.sign(form, '12345', { url })
+		expect(await reason(twilio.verify('12345'), headers, form, url)).toBe(true)
+		expect(await reason(twilio.verify('12345'), headers, form)).toBe('mismatch')
+		expect(
+			await reason(
+				twilio.verify('12345', { url: () => ['https://internal/x', url] }),
+				headers,
+				form
+			)
+		).toBe(true)
+	})
+})
+
+describe('hubspot', () => {
+	const url = 'https://example.com/hook?a=%3A'
+
+	test('signs METHOD + decoded url + body + timestamp', async () => {
+		const t = Date.now()
+		const headers = await hubspot.sign(payload, secret, { url, timestamp: t })
+		const expected = createHmac('sha256', secret)
+			.update(`POSThttps://example.com/hook?a=:${payload}${t}`)
+			.digest('base64')
+		expect(headers).toEqual({
+			'x-hubspot-signature-v3': expected,
+			'x-hubspot-request-timestamp': String(t)
+		})
+		expect(await reason(hubspot.verify(secret), headers, payload, url)).toBe(
+			true
+		)
+	})
+
+	test('rejects old timestamps', async () => {
+		const headers = await hubspot.sign(payload, secret, {
+			url,
+			timestamp: Date.now() - 301_000
+		})
+		expect(await reason(hubspot.verify(secret), headers, payload, url)).toBe(
+			'timestamp-out-of-tolerance'
+		)
 	})
 })

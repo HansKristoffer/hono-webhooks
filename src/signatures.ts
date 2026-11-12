@@ -1,5 +1,5 @@
 import type { Context } from 'hono'
-import type { Verify } from './index'
+import type { Verify, VerifyInput } from './index'
 
 /** A signing secret, or a function reading it per request (e.g. from `c.env`). */
 export type Secret = string | ((c: Context<any>) => string | Promise<string>)
@@ -25,7 +25,30 @@ export interface HmacOptions {
 	hash?: 'SHA-1' | 'SHA-256' | 'SHA-512'
 }
 
+/**
+ * The URL a provider signed. Behind a proxy `c.req.url` is the internal URL,
+ * so return the public one; return several and any match passes.
+ * @default (c) => c.req.url
+ */
+export type SignedUrl = (
+	c: Context<any>
+) => string | readonly string[] | Promise<string | readonly string[]>
+
+/**
+ * Why a built-in scheme rejected a request, passed to `fail` and so to
+ * `onEvent` as `validation.issues[0].message`.
+ */
+export type VerifyFailureReason =
+	| 'missing-header'
+	| 'malformed'
+	| 'timestamp-out-of-tolerance'
+	| 'mismatch'
+
 const encoder = new TextEncoder()
+
+/** `fail` is optional here so a scheme called by hand with a bare input still works. */
+const reject = (input: VerifyInput, reason: VerifyFailureReason) =>
+	input.fail?.(reason) ?? false
 
 /** A string secret is used as UTF-8; bytes are used as is. */
 function hmacKey(secret: string | Uint8Array, hash: string) {
@@ -91,6 +114,12 @@ function fromBase64(base64: string) {
 const resolveSecret = async (secret: Secret, c: Context) =>
 	typeof secret === 'function' ? secret(c) : secret
 
+const signedUrls = async (url: SignedUrl | undefined, c: Context) =>
+	[(await url?.(c)) ?? c.req.url].flat()
+
+const outsideTolerance = (seconds: number, toleranceSeconds: number) =>
+	Math.abs(Date.now() / 1000 - seconds) > toleranceSeconds
+
 /**
  * A scheme where one header carries an HMAC of the raw body. Covers most
  * providers; `github` and `shopify` are built with it.
@@ -102,22 +131,23 @@ export function hmac(options: HmacOptions): SignatureScheme {
 	const { header, encoding, prefix = '', hash = 'SHA-256' } = options
 	const name = header.toLowerCase()
 	return {
-		verify:
-			(secret) =>
-			async ({ c, rawBody, headers }) => {
-				const value = headers[name]
-				if (!value?.startsWith(prefix)) return false
-				const encoded = value.slice(prefix.length)
-				const signature =
-					encoding === 'hex' ? fromHex(encoded) : fromBase64(encoded)
-				if (!signature) return false
-				return hmacVerify(
-					await resolveSecret(secret, c),
-					rawBody,
+		verify: (secret) => async (input) => {
+			const value = input.headers[name]
+			if (!value) return reject(input, 'missing-header')
+			if (!value.startsWith(prefix)) return reject(input, 'malformed')
+			const encoded = value.slice(prefix.length)
+			const signature =
+				encoding === 'hex' ? fromHex(encoded) : fromBase64(encoded)
+			if (!signature) return reject(input, 'malformed')
+			return (
+				(await hmacVerify(
+					await resolveSecret(secret, input.c),
+					input.rawBody,
 					signature,
 					hash
-				)
-			},
+				)) || reject(input, 'mismatch')
+			)
+		},
 		async sign(rawBody, secret) {
 			const signature = await hmacSign(secret, rawBody, hash)
 			return {
@@ -133,6 +163,9 @@ export const github = hmac({
 	encoding: 'hex',
 	prefix: 'sha256='
 })
+
+/** Meta (WhatsApp, Messenger, Instagram): signs like GitHub, with the app secret. */
+export const meta = github
 
 /** Shopify: `x-shopify-hmac-sha256: <base64>`. */
 export const shopify = hmac({
@@ -150,27 +183,27 @@ export const stripe: SignatureScheme<
 > = {
 	verify:
 		(secret, { toleranceSeconds = 300 } = {}) =>
-		async ({ c, rawBody, headers }) => {
-			const parts = (headers['stripe-signature'] ?? '')
-				.split(',')
-				.map((part) => part.split('='))
+		async (input) => {
+			const header = input.headers['stripe-signature']
+			if (!header) return reject(input, 'missing-header')
+			const parts = header.split(',').map((part) => part.split('='))
 			// Signed over the timestamp exactly as sent.
 			const timestamp = parts.find(([k]) => k === 't')?.[1] ?? ''
-			if (!/^\d+$/.test(timestamp)) return false
-			if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSeconds) {
-				return false
+			if (!/^\d+$/.test(timestamp)) return reject(input, 'malformed')
+			if (outsideTolerance(Number(timestamp), toleranceSeconds)) {
+				return reject(input, 'timestamp-out-of-tolerance')
 			}
-			const key = await resolveSecret(secret, c)
+			const key = await resolveSecret(secret, input.c)
 			for (const [k, v] of parts) {
 				const signature = k === 'v1' && v ? fromHex(v) : undefined
 				if (
 					signature &&
-					(await hmacVerify(key, `${timestamp}.${rawBody}`, signature))
+					(await hmacVerify(key, `${timestamp}.${input.rawBody}`, signature))
 				) {
 					return true
 				}
 			}
-			return false
+			return reject(input, 'mismatch')
 		},
 	async sign(rawBody, secret, { timestamp } = {}) {
 		const t = timestamp ?? Math.floor(Date.now() / 1000)
@@ -201,28 +234,36 @@ export const svix: SignatureScheme<
 > = {
 	verify:
 		(secret, { toleranceSeconds = 300 } = {}) =>
-		async ({ c, rawBody, headers }) => {
+		async (input) => {
+			const { headers } = input
 			const prefix = headers['svix-id'] ? 'svix' : 'webhook'
 			const id = headers[`${prefix}-id`]
-			const timestamp = headers[`${prefix}-timestamp`] ?? ''
+			const timestamp = headers[`${prefix}-timestamp`]
 			const signatures = headers[`${prefix}-signature`]
-			if (!id || !signatures || !/^\d+$/.test(timestamp)) return false
-			if (Math.abs(Date.now() / 1000 - Number(timestamp)) > toleranceSeconds) {
-				return false
+			if (!id || !signatures || !timestamp) {
+				return reject(input, 'missing-header')
 			}
-			const key = svixKey(await resolveSecret(secret, c))
+			if (!/^\d+$/.test(timestamp)) return reject(input, 'malformed')
+			if (outsideTolerance(Number(timestamp), toleranceSeconds)) {
+				return reject(input, 'timestamp-out-of-tolerance')
+			}
+			const key = svixKey(await resolveSecret(secret, input.c))
 			for (const entry of signatures.split(' ')) {
 				const [version, encoded] = entry.split(',')
 				const signature =
 					version === 'v1' && encoded ? fromBase64(encoded) : undefined
 				if (
 					signature &&
-					(await hmacVerify(key, `${id}.${timestamp}.${rawBody}`, signature))
+					(await hmacVerify(
+						key,
+						`${id}.${timestamp}.${input.rawBody}`,
+						signature
+					))
 				) {
 					return true
 				}
 			}
-			return false
+			return reject(input, 'mismatch')
 		},
 	async sign(rawBody, secret, { id, timestamp } = {}) {
 		const msgId = id ?? `msg_${crypto.randomUUID().replaceAll('-', '')}`
@@ -235,6 +276,209 @@ export const svix: SignatureScheme<
 			'svix-id': msgId,
 			'svix-timestamp': String(t),
 			'svix-signature': `v1,${toBase64(signature)}`
+		}
+	}
+}
+
+export interface SharedSecretOptions {
+	/** Header carrying the secret, e.g. `x-gitlab-token` or `authorization`. */
+	header: string
+	/** Text before the secret in the header, e.g. `Bearer `. */
+	prefix?: string
+}
+
+// Web Crypto has no timingSafeEqual: HMAC the expected secret under a random
+// key, then let crypto.subtle.verify (constant time) check the given one.
+let compareKey: Promise<CryptoKey> | undefined
+async function secretsEqual(given: string, expected: string) {
+	if (!expected) throw new Error('hono-webhooks: the shared secret is empty')
+	compareKey ??= crypto.subtle.generateKey(
+		{ name: 'HMAC', hash: 'SHA-256' },
+		false,
+		['sign', 'verify']
+	) as Promise<CryptoKey>
+	const key = await compareKey
+	const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(expected))
+	return crypto.subtle.verify('HMAC', key, mac, encoder.encode(given))
+}
+
+/**
+ * A secret sent as is in a header (GitLab's `x-gitlab-token`, Telegram's
+ * `x-telegram-bot-api-secret-token`, `authorization: Bearer <token>`),
+ * compared in constant time. An empty secret throws (a 500).
+ *
+ * @example
+ * verify: sharedSecret({ header: 'x-gitlab-token' }).verify((c) => c.env.GITLAB_TOKEN)
+ */
+export function sharedSecret(options: SharedSecretOptions): SignatureScheme {
+	const { prefix = '' } = options
+	const name = options.header.toLowerCase()
+	return {
+		verify: (secret) => async (input) => {
+			const value = input.headers[name]
+			if (!value) return reject(input, 'missing-header')
+			if (!value.startsWith(prefix)) return reject(input, 'malformed')
+			return (
+				(await secretsEqual(
+					value.slice(prefix.length),
+					await resolveSecret(secret, input.c)
+				)) || reject(input, 'mismatch')
+			)
+		},
+		async sign(_rawBody, secret) {
+			return { [name]: `${prefix}${secret}` }
+		}
+	}
+}
+
+/**
+ * Infisical: `x-infisical-signature: t=<ms>;<hex>`, an HMAC-SHA256 of the
+ * JSON body. The body's own `timestamp` (milliseconds) is what is signed, so
+ * that is what must be within `toleranceSeconds` (default 300).
+ */
+export const infisical: SignatureScheme<{ toleranceSeconds?: number }> = {
+	verify:
+		(secret, { toleranceSeconds = 300 } = {}) =>
+		async (input) => {
+			const header = input.headers['x-infisical-signature']
+			if (!header) return reject(input, 'missing-header')
+			const signature = fromHex(header.split(';')[1] ?? '')
+			if (!signature?.length) return reject(input, 'malformed')
+			let timestamp: unknown
+			try {
+				timestamp = JSON.parse(input.rawBody)?.timestamp
+			} catch {}
+			if (typeof timestamp !== 'number') return reject(input, 'malformed')
+			if (
+				!(await hmacVerify(
+					await resolveSecret(secret, input.c),
+					input.rawBody,
+					signature
+				))
+			) {
+				return reject(input, 'mismatch')
+			}
+			return (
+				!outsideTolerance(timestamp / 1000, toleranceSeconds) ||
+				reject(input, 'timestamp-out-of-tolerance')
+			)
+		},
+	async sign(rawBody, secret) {
+		let t: unknown
+		try {
+			t = JSON.parse(rawBody)?.timestamp
+		} catch {}
+		const signature = toHex(await hmacSign(secret, rawBody))
+		return { 'x-infisical-signature': `t=${t ?? Date.now()};${signature}` }
+	}
+}
+
+/** Twilio signs the URL followed by each form field's name and value, sorted by name. */
+function twilioPayload(url: string, rawBody: string) {
+	const fields = [...new URLSearchParams(rawBody)].sort(([a, x], [b, y]) =>
+		a === b ? (x < y ? -1 : 1) : a < b ? -1 : 1
+	)
+	return url + fields.map(([k, v]) => k + v).join('')
+}
+
+/**
+ * Twilio: `x-twilio-signature: <base64>`, an HMAC-SHA1 with the auth token
+ * over the full public URL and the sorted form fields (`bodyType: 'form'`).
+ * Pass `url` when `c.req.url` is not the URL Twilio called.
+ *
+ * @example
+ * verify: twilio.verify((c) => c.env.TWILIO_AUTH_TOKEN, { url: (c) => publicUrl(c) })
+ */
+export const twilio: SignatureScheme<{ url?: SignedUrl }, { url: string }> = {
+	verify:
+		(secret, { url } = {}) =>
+		async (input) => {
+			const signature = input.headers['x-twilio-signature']
+			if (!signature) return reject(input, 'missing-header')
+			const bytes = fromBase64(signature)
+			if (!bytes) return reject(input, 'malformed')
+			const key = await resolveSecret(secret, input.c)
+			for (const candidate of await signedUrls(url, input.c)) {
+				const payload = twilioPayload(candidate, input.rawBody)
+				if (await hmacVerify(key, payload, bytes, 'SHA-1')) return true
+			}
+			return reject(input, 'mismatch')
+		},
+	async sign(rawBody, secret, options) {
+		if (!options?.url) throw new Error('hono-webhooks: twilio.sign needs a url')
+		const signature = await hmacSign(
+			secret,
+			twilioPayload(options.url, rawBody),
+			'SHA-1'
+		)
+		return { 'x-twilio-signature': toBase64(signature) }
+	}
+}
+
+const HUBSPOT_DECODE: Record<string, string> = {
+	'%3A': ':',
+	'%2F': '/',
+	'%3F': '?',
+	'%40': '@',
+	'%21': '!',
+	'%24': '$',
+	'%27': "'",
+	'%28': '(',
+	'%29': ')',
+	'%2A': '*',
+	'%2C': ',',
+	'%3B': ';'
+}
+
+/** HubSpot decodes these escapes in the URL before signing. */
+const hubspotUrl = (url: string) =>
+	url.replace(
+		/%(3A|2F|3F|40|21|24|27|28|29|2A|2C|3B)/gi,
+		(match) => HUBSPOT_DECODE[match.toUpperCase()] ?? match
+	)
+
+/**
+ * HubSpot v3: `x-hubspot-signature-v3: <base64>`, an HMAC-SHA256 with the
+ * app's client secret over `<METHOD><url><body><timestamp>`, and
+ * `x-hubspot-request-timestamp` in milliseconds, rejected when more than
+ * `toleranceSeconds` (default 300) away. Pass `url` when `c.req.url` is not
+ * the URL HubSpot called.
+ */
+export const hubspot: SignatureScheme<
+	{ url?: SignedUrl; toleranceSeconds?: number },
+	{ url: string; method?: string; timestamp?: number }
+> = {
+	verify:
+		(secret, { url, toleranceSeconds = 300 } = {}) =>
+		async (input) => {
+			const signature = input.headers['x-hubspot-signature-v3']
+			const timestamp = input.headers['x-hubspot-request-timestamp']
+			if (!signature || !timestamp) return reject(input, 'missing-header')
+			const bytes = fromBase64(signature)
+			if (!bytes || !/^\d+$/.test(timestamp)) return reject(input, 'malformed')
+			if (outsideTolerance(Number(timestamp) / 1000, toleranceSeconds)) {
+				return reject(input, 'timestamp-out-of-tolerance')
+			}
+			const key = await resolveSecret(secret, input.c)
+			const method = input.c.req.method.toUpperCase()
+			for (const candidate of await signedUrls(url, input.c)) {
+				const payload = `${method}${hubspotUrl(candidate)}${input.rawBody}${timestamp}`
+				if (await hmacVerify(key, payload, bytes)) return true
+			}
+			return reject(input, 'mismatch')
+		},
+	async sign(rawBody, secret, options) {
+		if (!options?.url)
+			throw new Error('hono-webhooks: hubspot.sign needs a url')
+		const t = options.timestamp ?? Date.now()
+		const method = (options.method ?? 'POST').toUpperCase()
+		const signature = await hmacSign(
+			secret,
+			`${method}${hubspotUrl(options.url)}${rawBody}${t}`
+		)
+		return {
+			'x-hubspot-signature-v3': toBase64(signature),
+			'x-hubspot-request-timestamp': String(t)
 		}
 	}
 }

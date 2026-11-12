@@ -18,18 +18,29 @@ import {
 } from './index'
 import {
 	github,
+	hubspot,
+	infisical,
+	meta,
 	type SignatureScheme,
 	shopify,
 	stripe,
-	svix
+	svix,
+	twilio
 } from './signatures'
 
 const schemes: Record<string, SignatureScheme<any, any>> = {
 	github,
+	hubspot,
+	infisical,
+	meta,
 	shopify,
 	stripe,
-	svix
+	svix,
+	twilio
 }
+
+/** `request()` with a bare path runs at this origin, so URL-signing schemes sign it. */
+const ORIGIN = 'http://localhost'
 
 /** A file path relative to the cwd, or a package name. */
 const importModule = (specifier: string) =>
@@ -119,6 +130,7 @@ const list = defineCommand({
 				`${config.method.padEnd(7)} ${config.path}${config.description ? `  ${config.description}` : ''}`
 			)
 			if (validates) print(ctx, `        validates ${validates}`)
+			if (config.verify === false) print(ctx, '        public (verify: false)')
 		}
 	}
 })
@@ -213,6 +225,7 @@ const testCommand = defineCommand({
 				headers.set('content-type', 'text/plain')
 			}
 		}
+		const url = `${path.startsWith('/') ? path : `/${path}`}${input.query ? `?${input.query}` : ''}`
 		if (input.sign) {
 			const scheme = schemes[input.sign]
 			if (!scheme) {
@@ -225,13 +238,15 @@ const testCommand = defineCommand({
 			const secret = ctx.env[name]
 			if (secret === undefined) throw new CliError(`${name} is not set`)
 			for (const [key, value] of Object.entries(
-				await scheme.sign(input.body ?? '', secret)
+				await scheme.sign(input.body ?? '', secret, {
+					url: ORIGIN + url,
+					method: method.toUpperCase()
+				})
 			)) {
 				headers.set(key, value)
 			}
 		}
 
-		const url = `${path.startsWith('/') ? path : `/${path}`}${input.query ? `?${input.query}` : ''}`
 		const start = performance.now()
 		const res = await ctx.context.request(url, {
 			method: method.toUpperCase(),

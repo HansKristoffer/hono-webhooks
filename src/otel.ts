@@ -9,6 +9,7 @@ import {
 } from '@opentelemetry/api'
 import type { Context, Env } from 'hono'
 import {
+	type SummaryOptions,
 	summarizeEvent,
 	type WebhookEvent,
 	type WebhookEventSummary,
@@ -58,6 +59,8 @@ export interface WebhookCall extends WebhookEventSummary {
 	/** `error` for 5xx, `warn` for 4xx, else `info`. */
 	level: 'info' | 'warn' | 'error'
 	outcome: 'success' | 'failed' | 'validation_failed'
+	/** The route is in `ignoreRoutes`: no metrics or log were recorded. */
+	ignored: boolean
 }
 
 /** `console` fits, as does any logger with these three methods. */
@@ -73,10 +76,12 @@ export interface OtelWebhooksOptions<E extends Env = any> {
 	meter?: Meter
 	/** Routes that get a span but no metrics, e.g. `['/health']`. */
 	ignoreRoutes?: readonly string[]
+	/** What `call` keeps of the request, as for `summarizeEvent`. */
+	summary?: SummaryOptions
 	/**
-	 * Called after every request, ignored routes included, with the span
-	 * still active: log it, store it. A returned promise is handled like
-	 * `onEvent`'s.
+	 * Called after every request, ignored routes included (`call.ignored`),
+	 * with the span still active: log it, store it. A returned promise is
+	 * handled like `onEvent`'s.
 	 */
 	onWebhookCall?: (
 		call: WebhookCall,
@@ -85,7 +90,7 @@ export interface OtelWebhooksOptions<E extends Env = any> {
 	/**
 	 * Logs one `webhook.completed` event per request at `call.level`, with
 	 * `route`, `method`, `status_code`, `duration_ms`, `status` (the outcome)
-	 * and `error_type`. 404s and `ignoreRoutes` are skipped. Called with the
+	 * `error_type` and `error_message`. 404s and `ignoreRoutes` are skipped. Called with the
 	 * request's span, so the logger can attach to it.
 	 *
 	 * @example
@@ -135,9 +140,10 @@ export function otelWebhooks<E extends Env = any>(
 			)
 		},
 		onEvent: (event) => {
-			const summary = summarizeEvent(event)
+			const summary = summarizeEvent(event, options.summary)
 			const success = summary.status < 400
 			const call: WebhookCall = {
+				ignored: summary.route !== null && ignored.has(summary.route),
 				...summary,
 				level: summary.status >= 500 ? 'error' : success ? 'info' : 'warn',
 				outcome: summary.validation
@@ -163,8 +169,7 @@ export function otelWebhooks<E extends Env = any>(
 				code: success ? SpanStatusCode.OK : SpanStatusCode.ERROR
 			})
 
-			const isIgnored = call.route !== null && ignored.has(call.route)
-			if (!isIgnored) {
+			if (!call.ignored) {
 				// Created lazily so a meter provider registered after import still applies.
 				instruments ??= createInstruments(
 					options.meter ?? metrics.getMeter('webhooks')
@@ -177,7 +182,7 @@ export function otelWebhooks<E extends Env = any>(
 				instruments.duration.record(event.durationMs, attributes)
 			}
 
-			if (span && options.logger && call.route !== null && !isIgnored) {
+			if (span && options.logger && call.route !== null && !call.ignored) {
 				options.logger(span)[call.level]('webhook.completed', {
 					event: 'webhook.completed',
 					route: call.route,
@@ -185,7 +190,10 @@ export function otelWebhooks<E extends Env = any>(
 					status_code: call.status,
 					duration_ms: call.durationMs,
 					status: call.outcome,
-					...(call.error && { error_type: call.error.name })
+					...(call.error && {
+						error_type: call.error.name,
+						error_message: call.error.message
+					})
 				})
 			}
 

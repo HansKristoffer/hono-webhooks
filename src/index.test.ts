@@ -14,7 +14,8 @@ import {
 	type Webhook,
 	type WebhookEvent,
 	type WebhooksOptions,
-	WebhookValidationError
+	WebhookValidationError,
+	webhookPath
 } from './index'
 
 const mount = (webhooks: Webhook[], options?: WebhooksOptions) => {
@@ -25,6 +26,7 @@ const mount = (webhooks: Webhook[], options?: WebhooksOptions) => {
 
 const post = (body: unknown, contentType = 'application/json') => ({
 	method: 'POST',
+	verify: false,
 	headers: { 'content-type': contentType },
 	body: typeof body === 'string' ? body : JSON.stringify(body)
 })
@@ -73,7 +75,7 @@ describe('routing', () => {
 			() => 'get'
 		)
 		const put = defineWebhook(
-			{ method: 'PUT', path: '/items/:id' },
+			{ method: 'PUT', verify: false, path: '/items/:id' },
 			() => 'put'
 		)
 		const app = mount([get, put])
@@ -212,6 +214,7 @@ describe('body', () => {
 	const createUser = defineWebhook(
 		{
 			method: 'POST',
+			verify: false,
 			path: '/users',
 			body: z.object({ name: z.string(), email: z.email() })
 		},
@@ -259,6 +262,7 @@ describe('body', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/json',
 				bodyType: 'json',
 				body: z.object({ a: z.number() })
@@ -274,7 +278,7 @@ describe('body', () => {
 
 	test('parses vendor JSON types', async () => {
 		const route = defineWebhook(
-			{ method: 'POST', path: '/cloudevents' },
+			{ method: 'POST', verify: false, path: '/cloudevents' },
 			({ body }) => ({ body })
 		)
 		const res = await mount([route]).request(
@@ -288,6 +292,7 @@ describe('body', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/twilio',
 				body: z.object({ From: z.string(), Body: z.string() })
 			},
@@ -302,7 +307,7 @@ describe('body', () => {
 
 	test('parses text bodies', async () => {
 		const route = defineWebhook(
-			{ method: 'POST', path: '/text', body: z.string() },
+			{ method: 'POST', verify: false, path: '/text', body: z.string() },
 			({ body }) => body.toUpperCase()
 		)
 		const res = await mount([route]).request(
@@ -315,7 +320,7 @@ describe('body', () => {
 
 	test('an empty body is undefined', async () => {
 		const route = defineWebhook(
-			{ method: 'POST', path: '/empty' },
+			{ method: 'POST', verify: false, path: '/empty' },
 			({ body }) => ({ empty: body === undefined })
 		)
 		const res = await mount([route]).request('/webhooks/empty', {
@@ -329,6 +334,7 @@ describe('body', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/stripe',
 				body: z.object({ id: z.string(), type: z.string() })
 			},
@@ -352,7 +358,7 @@ describe('responses', () => {
 
 	test('handlers can use the Hono context', async () => {
 		const route = defineWebhook(
-			{ method: 'POST', path: '/accepted' },
+			{ method: 'POST', verify: false, path: '/accepted' },
 			({ c }) => c.json({ queued: true }, 202)
 		)
 		const res = await mount([route]).request('/webhooks/accepted', {
@@ -362,7 +368,10 @@ describe('responses', () => {
 	})
 
 	test('returning nothing answers 204', async () => {
-		const route = defineWebhook({ method: 'POST', path: '/ack' }, () => {})
+		const route = defineWebhook(
+			{ method: 'POST', verify: false, path: '/ack' },
+			() => {}
+		)
 		const res = await mount([route]).request('/webhooks/ack', {
 			method: 'POST'
 		})
@@ -411,7 +420,12 @@ describe('errors', () => {
 
 	test('onError can replace any error response', async () => {
 		const route = defineWebhook(
-			{ method: 'POST', path: '/x', body: z.object({ a: z.string() }) },
+			{
+				method: 'POST',
+				verify: false,
+				path: '/x',
+				body: z.object({ a: z.string() })
+			},
 			() => ({})
 		)
 		const app = mount([route], {
@@ -435,6 +449,7 @@ describe('onEvent', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/orders/:id',
 				body: z.object({ total: z.number() })
 			},
@@ -468,7 +483,12 @@ describe('onEvent', () => {
 			throw new Error('boom')
 		})
 		const typed = defineWebhook(
-			{ method: 'POST', path: '/typed', body: z.object({ a: z.string() }) },
+			{
+				method: 'POST',
+				verify: false,
+				path: '/typed',
+				body: z.object({ a: z.string() })
+			},
 			() => ({})
 		)
 		const app = mount([boom, typed], { onEvent })
@@ -506,6 +526,7 @@ describe('schema libraries', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/v/:n',
 				params: v.object({ n: v.pipe(v.string(), v.transform(Number)) }),
 				body: v.object({ name: v.string() })
@@ -523,6 +544,7 @@ describe('schema libraries', () => {
 		const route = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/async',
 				body: z.object({ a: z.string() }).refine(async (b) => b.a === 'ok')
 			},
@@ -583,6 +605,7 @@ export const typeChecks = [
 	defineWebhook(
 		{
 			method: 'POST',
+			verify: false,
 			path: '/b',
 			body: z.object({ n: z.number() }),
 			response: z.object({ ok: z.boolean() })
@@ -605,7 +628,12 @@ describe('around', () => {
 	test('wraps matched, invalid, 404 and 405 requests with the route known', async () => {
 		const seen: string[] = []
 		const typed = defineWebhook(
-			{ method: 'POST', path: '/typed/:id', body: z.object({ a: z.string() }) },
+			{
+				method: 'POST',
+				verify: false,
+				path: '/typed/:id',
+				body: z.object({ a: z.string() })
+			},
 			() => ({})
 		)
 		const app = mount([typed], {
@@ -694,6 +722,7 @@ describe('events', () => {
 		const typed = defineWebhook(
 			{
 				method: 'POST',
+				verify: false,
 				path: '/orders/:id',
 				body: z.object({ total: z.number() })
 			},
@@ -713,7 +742,7 @@ describe('events', () => {
 		})
 		await app.request('/webhooks/orders/1', post({ total: 1 }))
 
-		const [invalid, failed] = events.map(summarizeEvent)
+		const [invalid, failed] = events.map((e) => summarizeEvent(e))
 		expect(invalid).toMatchObject({
 			route: '/orders/:id',
 			method: 'POST',
@@ -792,6 +821,7 @@ describe('testWebhook', () => {
 	const order = defineWebhook(
 		{
 			method: 'POST',
+			verify: false,
 			path: '/orders/:id/:note?',
 			query: z.object({ dry: z.enum(['1', '0']).optional() }),
 			body: z.object({ total: z.number() })
@@ -853,5 +883,173 @@ describe('testWebhook', () => {
 		expect((await testWebhook(signed, { body: { Body: 'x' } })).status).toBe(
 			401
 		)
+	})
+})
+
+describe('verify is required', () => {
+	test('a non-GET webhook without verify fails at startup', () => {
+		const open = defineWebhook({ method: 'POST', path: '/open' }, () => {})
+		expect(() => createWebhooks([open])).toThrow(
+			'hono-webhooks: POST /open has no verify. Pass a verify function, or verify: false if it is public on purpose.'
+		)
+		expect(() => createWebhooks([health])).not.toThrow()
+	})
+
+	test('verify: false is public and described as unverified', async () => {
+		const open = defineWebhook(
+			{ method: 'POST', path: '/open', verify: false },
+			() => 'ok'
+		)
+		const res = await createWebhooks([open]).request('/open', {
+			method: 'POST'
+		})
+		expect(await res.text()).toBe('ok')
+		expect(describeWebhooks([open])[0]?.verified).toBe(false)
+	})
+
+	test('fail(reason) reaches onEvent but not the response', async () => {
+		const { events, onEvent } = collectEvents()
+		const guarded = defineWebhook(
+			{
+				method: 'POST',
+				path: '/guarded',
+				verify: ({ fail }) => fail('no token')
+			},
+			() => {}
+		)
+		const res = await createWebhooks([guarded], { onEvent }).request(
+			'/guarded',
+			{ method: 'POST' }
+		)
+		expect(res.status).toBe(401)
+		expect(await res.json()).toEqual({ error: 'Invalid signature' })
+		expect(events[0]?.validation?.issues).toEqual([{ message: 'no token' }])
+	})
+})
+
+describe('body limit', () => {
+	const echo = defineWebhook(
+		{ method: 'POST', path: '/echo', verify: () => true },
+		({ rawBody }) => String(rawBody.length)
+	)
+	const big = defineWebhook(
+		{ method: 'POST', path: '/big', verify: false, maxBodyBytes: 10 },
+		({ rawBody }) => String(rawBody.length)
+	)
+	const send = (
+		app: ReturnType<typeof createWebhooks>,
+		path: string,
+		size: number
+	) => app.request(path, { method: 'POST', body: 'x'.repeat(size) })
+
+	test('answers 413 over 1 MiB by default, before verify', async () => {
+		const { events, onEvent } = collectEvents()
+		const app = createWebhooks([echo], { onEvent })
+		expect(await (await send(app, '/echo', 1024 * 1024)).text()).toBe(
+			String(1024 * 1024)
+		)
+		const res = await send(app, '/echo', 1024 * 1024 + 1)
+		expect(res.status).toBe(413)
+		expect(await res.json()).toEqual({ error: 'Payload too large' })
+		expect(events.map((e) => e.status)).toEqual([200, 413])
+	})
+
+	test('a streamed body without content-length is cut off too', async () => {
+		const app = createWebhooks([big])
+		const stream = new ReadableStream({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('x'.repeat(11)))
+				controller.close()
+			}
+		})
+		const res = await app.request('/big', {
+			method: 'POST',
+			body: stream,
+			duplex: 'half'
+		})
+		expect(res.status).toBe(413)
+	})
+
+	test('the webhook overrides the app, Infinity turns it off', async () => {
+		const app = createWebhooks([echo, big], { maxBodyBytes: 5 })
+		expect((await send(app, '/echo', 6)).status).toBe(413)
+		expect((await send(app, '/big', 10)).status).toBe(200)
+		const unlimited = createWebhooks([echo], { maxBodyBytes: Infinity })
+		expect((await send(unlimited, '/echo', 2 * 1024 * 1024)).status).toBe(200)
+	})
+})
+
+describe('summarizeEvent options', () => {
+	test('drops the body and query, keeps named headers', async () => {
+		const { events, onEvent } = collectEvents()
+		const hook = defineWebhook(
+			{ method: 'POST', path: '/s', verify: false },
+			() => ({ secret: 'reply' })
+		)
+		await createWebhooks([hook], { onEvent }).request('/s?token=t', {
+			...post({ card: '4242' }),
+			headers: {
+				'content-type': 'application/json',
+				'x-github-delivery': 'd-1',
+				authorization: 'secret'
+			}
+		})
+		const [event] = events
+		if (!event) throw new Error('no event')
+		expect(summarizeEvent(event)).not.toHaveProperty('headers')
+		expect(
+			summarizeEvent(event, {
+				body: false,
+				query: false,
+				headers: ['x-github-delivery', 'x-missing']
+			})
+		).toMatchObject({
+			body: null,
+			response: null,
+			query: null,
+			headers: { 'x-github-delivery': 'd-1' }
+		})
+	})
+})
+
+describe('webhookPath', () => {
+	test('fills params into the pattern', () => {
+		const callback = defineWebhook(
+			{ method: 'GET', path: '/channels/:provider/callback/:step?' },
+			() => {}
+		)
+		expect(webhookPath(callback, { provider: 'a b' })).toBe(
+			'/channels/a%20b/callback'
+		)
+		expect(webhookPath(health)).toBe('/health')
+		// @ts-expect-error provider is required
+		webhookPath(callback, {})
+	})
+})
+
+describe('testWebhook and URL-signed schemes', () => {
+	test('sign gets the request url, baseUrl sets its origin', async () => {
+		const { twilio } = await import('./signatures')
+		const incoming = defineWebhook(
+			{
+				method: 'POST',
+				path: '/incoming',
+				bodyType: 'form',
+				verify: twilio.verify('tok')
+			},
+			() => 'ok'
+		)
+		const urls: string[] = []
+		const res = await testWebhook(incoming, {
+			baseUrl: 'https://api.example.com/',
+			query: { a: '1' },
+			body: { CallSid: 'CA1' },
+			sign: (raw, { url }) => {
+				urls.push(url)
+				return twilio.sign(raw, 'tok', { url })
+			}
+		})
+		expect(res.status).toBe(200)
+		expect(urls).toEqual(['https://api.example.com/incoming?a=1'])
 	})
 })

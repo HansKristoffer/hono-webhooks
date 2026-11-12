@@ -19,7 +19,8 @@ export const webhooks = [
 			body: z.object({ total: z.number() })
 		},
 		({ params, body }) => ({ id: params.id, total: body.total })
-	)
+	),
+	defineWebhook({ method: 'POST', path: '/beacon', verify: false }, () => {})
 ]
 
 async function run(...argv: string[]) {
@@ -130,7 +131,7 @@ Options:
   -b, --body <string>        Request body (JSON sets content-type: application/json)
   -q, --query <string>       Query string, e.g. "a=1&b=2"
   -H, --header <string>...   Request header "name: value", repeatable
-  -s, --sign <string>        Sign the body: github, shopify, stripe, svix
+  -s, --sign <string>        Sign the body: github, hubspot, infisical, meta, shopify, stripe, svix, twilio
   -e, --secret-env <string>  Environment variable holding the signing secret
   -h, --help                 Show help
 
@@ -152,6 +153,8 @@ test('list', async () => {
 		stdout: `GET     /health  Liveness
 POST    /orders/:id
         validates body, signature
+POST    /beacon
+        public (verify: false)
 `,
 		stderr: ''
 	})

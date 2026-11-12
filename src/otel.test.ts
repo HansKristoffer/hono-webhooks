@@ -32,12 +32,13 @@ const webhooks = [
 	defineWebhook(
 		{
 			method: 'POST',
+			verify: false,
 			path: '/orders/:id',
 			body: z.object({ total: z.number() })
 		},
 		({ params }) => ({ id: params.id })
 	),
-	defineWebhook({ method: 'POST', path: '/boom' }, () => {
+	defineWebhook({ method: 'POST', verify: false, path: '/boom' }, () => {
 		throw new Error('kaboom')
 	})
 ]
@@ -171,8 +172,26 @@ describe('otelWebhooks', () => {
 		expect(spans()).toHaveLength(1)
 		expect((await metrics()).total).toEqual([])
 		expect(calls).toHaveLength(1)
-		expect(calls[0]?.[0]).toMatchObject({ route: '/health', status: 200 })
+		expect(calls[0]?.[0]).toMatchObject({
+			route: '/health',
+			status: 200,
+			ignored: true
+		})
 		expect(calls[0]?.[1].route).toBe('/health')
+	})
+
+	test('summary options shape the call', async () => {
+		const calls: WebhookCall[] = []
+		const { app } = setup({
+			summary: { body: false },
+			onWebhookCall: (call) => void calls.push(call)
+		})
+		await app.request('/webhooks/orders/42', post({ total: 1 }))
+		expect(calls[0]).toMatchObject({
+			ignored: false,
+			body: null,
+			response: null
+		})
 	})
 
 	test('onWebhookCall gets the level and outcome', async () => {
@@ -238,7 +257,8 @@ describe('otelWebhooks', () => {
 					status_code: 500,
 					duration_ms: expect.any(Number),
 					status: 'failed',
-					error_type: 'Error'
+					error_type: 'Error',
+					error_message: 'kaboom'
 				}
 			]
 		])

@@ -9,12 +9,14 @@ and others.
 ```ts
 import { Hono } from 'hono'
 import { createWebhooks, defineWebhook } from 'hono-webhooks'
+import { sharedSecret } from 'hono-webhooks/signatures'
 import { z } from 'zod'
 
 const orderPaid = defineWebhook(
 	{
 		method: 'POST',
 		path: '/shop/orders/:orderId/paid',
+		verify: sharedSecret({ header: 'x-shop-token' }).verify((c) => c.env.SHOP_TOKEN),
 		body: z.object({ amount: z.number(), currency: z.string() })
 	},
 	async ({ params, body }) => {
@@ -32,10 +34,13 @@ app.route('/webhooks', createWebhooks([orderPaid]))
   value is checked against the `response` schema.
 - **Any schema library.** Zod, Valibot, ArkType, Effect Schema, or anything
   else that implements Standard Schema. Async schemas work too.
-- **Signed webhooks built in.** `verify` checks the signature on the raw
-  body before anything is parsed, with ready-made verifiers and signers for
-  Stripe, GitHub, Shopify and any HMAC scheme. `rawBody` is always passed to
-  the handler too.
+- **Signed webhooks built in, and required.** `verify` checks the signature
+  on the raw body before anything is parsed, with ready-made verifiers and
+  signers for Stripe, GitHub, Meta, Shopify, Svix, Twilio, HubSpot, Infisical,
+  shared secrets and any HMAC scheme. A webhook that takes a body must have a
+  `verify`, or say `verify: false`. `rawBody` is always passed to the handler
+  too.
+- **Bounded bodies.** Bodies over 1 MiB answer 413 before they are read.
 - **Plain Hono.** `createWebhooks` returns a Hono app. Handlers get the Hono
   context `c`, Hono middleware works, `HTTPException` works, and it runs on
   every runtime Hono supports.
@@ -63,6 +68,7 @@ app.route('/webhooks', createWebhooks([orderPaid]))
 - [Testing](#testing)
 - [CLI](#cli)
 - [API reference](#api-reference)
+- [Upgrading to 0.6](#upgrading-to-06)
 - [Upgrading from 0.1](#upgrading-from-01)
 - [Migrating from `createHttpRoute`](#migrating-from-createhttproute)
 - [Releasing](#releasing)
@@ -93,14 +99,15 @@ export const updateItem = defineWebhook(
 		method: 'PUT',
 		path: '/items/:id',
 		description: 'Update an item from the ERP',
+		verify: sharedSecret({ header: 'x-api-key' }).verify((c) => c.env.ERP_KEY),
 		params: v.object({ id: v.pipe(v.string(), v.transform(Number)) }),
 		query: v.object({ dryRun: v.optional(v.picklist(['true', 'false'])) }),
-		headers: v.object({ 'x-api-key': v.string() }),
+		headers: v.object({ 'x-erp-user': v.string() }),
 		body: v.object({ name: v.string(), price: v.number() }),
 		response: v.object({ id: v.number(), updated: v.boolean() })
 	},
 	async ({ params, query, headers, body }) => {
-		// params.id: number, body.price: number, headers['x-api-key']: string
+		// params.id: number, body.price: number, headers['x-erp-user']: string
 		return { id: params.id, updated: query.dryRun !== 'true' }
 	}
 )
@@ -114,7 +121,8 @@ export const updateItem = defineWebhook(
 | `query`       | Standard Schema                                               | Validates the query string as `Record<string, string>`.                                                 |
 | `headers`     | Standard Schema                                               | Validates headers as `Record<string, string>` with **lower-case** names.                                |
 | `body`        | Standard Schema                                               | Validates the parsed body (see [Body parsing](#body-parsing)).                                          |
-| `verify`      | `({ c, rawBody, headers }) => boolean \| Promise<boolean>`     | Checks the signature before the body is parsed (see [Signature verification](#signature-verification)). |
+| `verify`      | `({ c, rawBody, headers, fail }) => boolean \| Promise<boolean>`, or `false` | Checks the signature before the body is parsed. Required for every method but `GET`; `false` means public on purpose (see [Signature verification](#signature-verification)). |
+| `maxBodyBytes` | `number`                                                     | Overrides the app's body limit for this webhook (see [Mounting](#mounting)).                             |
 | `response`    | Standard Schema                                               | Types the handler's return value and checks it at runtime (see [Return values](#return-values)).        |
 | `bodyType`    | `'auto' \| 'json' \| 'form' \| 'text'`                        | How to parse the body. Default `'auto'`.                                                                |
 | `description` | `string`                                                      | Shown by `hono-webhooks list`.                                                                          |
@@ -201,36 +209,140 @@ export const orderCreated = defineWebhook(
 )
 ```
 
-When `verify` returns `false`, the answer is
-`401 { error: 'Invalid signature', issues: [...] }` and `onEvent` gets
-`validation.target: 'signature'`.
+When `verify` returns anything but `true`, the answer is
+`401 { error: 'Invalid signature' }` and `onEvent` gets
+`validation.target: 'signature'` with the reason in
+`validation.issues[0].message` (see [Failure reasons](#failure-reasons)).
+
+### Every webhook says how it is authenticated
+
+`verify` is required for every method except `GET`. `createWebhooks` throws
+at startup for a webhook that has none:
+
+```text
+hono-webhooks: POST /update-secrets has no verify. Pass a verify function, or verify: false if it is public on purpose.
+```
+
+Pass `verify: false` for a webhook that really is public, such as a device
+that cannot sign or a beacon. `describeWebhooks` reports it as
+`verified: false` and `hono-webhooks list` prints `public (verify: false)`.
+`GET` webhooks (health checks, provider URL challenges, OAuth callbacks) may
+leave `verify` out.
+
+A check that is not a signature still belongs in `verify`: an API key, an
+OAuth `state`, a channel token. That keeps unauthenticated callers at 401
+before any schema runs.
+
+### Schemes
 
 `hono-webhooks/signatures` has a verifier and a matching signer per provider:
 
 | Scheme                                  | Header                                  | Signed content      |
 | --------------------------------------- | --------------------------------------- | ------------------- |
-| `github`                                | `x-hub-signature-256: sha256=<hex>`     | body                |
+| `github`, `meta` (WhatsApp, Messenger, Instagram) | `x-hub-signature-256: sha256=<hex>` | body          |
 | `shopify`                               | `x-shopify-hmac-sha256: <base64>`       | body                |
 | `stripe`                                | `stripe-signature: t=<unix>,v1=<hex>`   | `<t>.<body>`        |
 | `svix` (Resend, Clerk, Standard Webhooks) | `svix-id`, `svix-timestamp`, `svix-signature: v1,<base64> ...` (or `webhook-*`) | `<id>.<timestamp>.<body>`, key from `whsec_<base64>` |
+| `infisical`                             | `x-infisical-signature: t=<ms>;<hex>`   | body (which carries the `timestamp`) |
+| `twilio`                                | `x-twilio-signature: <base64>` (HMAC-SHA1) | URL + sorted form fields |
+| `hubspot` (v3)                          | `x-hubspot-signature-v3: <base64>`, `x-hubspot-request-timestamp` | `<METHOD><url><body><timestamp>` |
+| `sharedSecret({ header, prefix? })`     | the secret itself, e.g. `authorization: Bearer <token>` | nothing; compared in constant time |
 | `hmac({ header, encoding, prefix?, hash? })` | any header, hex or base64, SHA-1/256/512 | body          |
 
 - `scheme.verify(secret)` gives a `verify` function. `secret` is a string or
   `(c) => string | Promise<string>`, so it can come from `c.env`. An empty
   secret throws (a 500), instead of silently accepting or rejecting everything.
-- `stripe.verify(secret, { toleranceSeconds })` and `svix.verify(...)` also
-  reject timestamps more than 300 seconds away by default, and accept any
-  matching `v1` so secret rotation works.
-- `scheme.sign(rawBody, secret)` returns the headers the provider would send,
-  for tests and the CLI.
+- `stripe`, `svix`, `infisical` and `hubspot` reject timestamps more than 300
+  seconds away by default (`verify(secret, { toleranceSeconds })`). `stripe`
+  and `svix` accept any matching `v1`, so secret rotation works.
+- `twilio` and `hubspot` sign the URL the provider called. Behind a proxy
+  `c.req.url` is the internal URL, so pass the public one:
+  `twilio.verify(secret, { url: (c) => publicUrl(c) })`. Return an array to
+  try several; any match passes.
+- `scheme.sign(rawBody, secret, options?)` returns the headers the provider
+  would send, for tests and the CLI. `twilio.sign` and `hubspot.sign` need
+  `{ url }`.
 - Signatures are compared with `crypto.subtle.verify`, which runs in constant
-  time. Everything uses Web Crypto, so it works on every runtime.
+  time; `sharedSecret` compares through it too. Everything uses Web Crypto,
+  so it works on every runtime.
 
-For another provider, write the function yourself:
+### Shared secrets
+
+For a provider that sends a fixed token instead of a signature (GitLab's
+`x-gitlab-token`, Telegram's `x-telegram-bot-api-secret-token`, a bearer
+token), use `sharedSecret`. Do not compare with `===`: it is not constant
+time, and an unset secret and a missing header compare equal
+(`undefined === undefined`).
 
 ```ts
-verify: async ({ c, rawBody, headers }) =>
-	headers['x-token'] === c.env.WEBHOOK_TOKEN
+import { sharedSecret } from 'hono-webhooks/signatures'
+
+verify: sharedSecret({ header: 'x-gitlab-token' }).verify((c) => c.env.GITLAB_WEBHOOK_TOKEN)
+verify: sharedSecret({ header: 'authorization', prefix: 'Bearer ' }).verify(() => getSecret('API_TOKEN'))
+```
+
+To accept either of two headers, try both:
+
+```ts
+const header = sharedSecret({ header: 'x-once-secret' }).verify(secret)
+const bearer = sharedSecret({ header: 'authorization', prefix: 'Bearer ' }).verify(secret)
+verify: async (input) => (await header(input)) || bearer(input)
+```
+
+### Writing your own
+
+A scheme that signs a timestamp in its own format (Slack's
+`v0:<timestamp>:<body>`, for example) needs a hand-written `verify`. Check the
+timestamp, and return `fail(reason)` so the operator sees why:
+
+```ts
+import { createHmac, timingSafeEqual } from 'node:crypto'
+
+verify: ({ c, rawBody, headers, fail }) => {
+	const timestamp = Number(headers['x-slack-request-timestamp'])
+	const given = headers['x-slack-signature'] ?? ''
+	if (!timestamp || !given) return fail('missing-header')
+	if (Math.abs(Date.now() / 1000 - timestamp) > 300) return fail('timestamp-out-of-tolerance')
+	const expected = `v0=${createHmac('sha256', c.env.SLACK_SIGNING_SECRET).update(`v0:${timestamp}:${rawBody}`).digest('hex')}`
+	return (
+		(given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected))) ||
+		fail('mismatch')
+	)
+}
+```
+
+### Failure reasons
+
+`fail(reason)` records why a check failed and returns `false`. The reason
+goes to `onEvent` as `validation.issues[0].message` (and so to
+`summarizeEvent(e).validation.message`), never to the caller. The built-in
+schemes use `missing-header`, `malformed`, `timestamp-out-of-tolerance` and
+`mismatch`, so a log tells clock skew from a wrong secret. A plain `false`
+gives `Signature does not match`.
+
+### Passing what `verify` learned to the handler
+
+When the check finds out who is calling (an API key's organization, a
+decoded JWT), set it on the context and read it in the handler. Type it with
+[`createWebhookFactory`](#typed-env-and-middleware):
+
+```ts
+type AppEnv = { Variables: { caller?: { organizationId: string } } }
+const { defineWebhook } = createWebhookFactory<AppEnv>()
+
+defineWebhook(
+	{
+		method: 'POST',
+		path: '/sessions',
+		verify: async ({ c, fail }) => {
+			const caller = await findApiKey(c.req.header('authorization'))
+			if (!caller) return fail('unknown api key')
+			c.set('caller', caller)
+			return true
+		}
+	},
+	({ c }) => createSession(c.var.caller!.organizationId)
+)
 ```
 
 ## Mounting
@@ -251,6 +363,15 @@ Below that prefix:
 - A static path wins over a dynamic one that also matches (`/users/me` beats
   `/users/:id`) no matter which order they were passed in.
 - Defining the same method and path twice throws when `createWebhooks` runs.
+- A body over `maxBodyBytes` (default 1 MiB) answers
+  `413 { error: 'Payload too large' }` before it is read or verified, from
+  `content-length` or while streaming. Set it on `createWebhooks(webhooks, {
+  maxBodyBytes })` or per webhook; `Infinity` turns it off.
+
+Anything mounted under the prefix gets the webhooks' behavior: the body
+limit, `onEvent`, logging and metrics. A health check defined as a webhook
+is fine; skip it in metrics and logs with `ignoreRoutes: ['/health']` (see
+[OpenTelemetry](#opentelemetry)).
 
 Because the webhooks app answers 404 for anything under its prefix, mount it
 under its own prefix (`/webhooks`), not at `/`.
@@ -277,7 +398,7 @@ export const { defineWebhook, createWebhooks } = createWebhookFactory<AppEnv>()
 ```
 
 ```ts
-defineWebhook({ method: 'POST', path: '/ping' }, ({ c }) => {
+defineWebhook({ method: 'POST', path: '/ping', verify: false }, ({ c }) => {
 	c.env.DB // D1Database
 	c.var.requestId // string
 })
@@ -300,6 +421,8 @@ Anything thrown while handling a request becomes a response:
 | Thrown                                               | Default response                                  |
 | ---------------------------------------------------- | ------------------------------------------------- |
 | `WebhookValidationError` (a request schema failed)   | `400 { error: 'Invalid body', issues: [...] }`     |
+| `WebhookValidationError` (the signature check failed) | `401 { error: 'Invalid signature' }`             |
+| a body over `maxBodyBytes`                           | `413 { error: 'Payload too large' }`               |
 | Hono's `HTTPException`                               | Its status and `{ error: message }`, or its `res`  |
 | anything else                                        | `500 { error: 'Internal Server Error' }`, and the error is logged with `console.error` |
 
@@ -310,7 +433,9 @@ Throw an `HTTPException` from a handler to answer with another status:
 ```ts
 import { HTTPException } from 'hono/http-exception'
 
-defineWebhook({ method: 'POST', path: '/orders/:id' }, async ({ params }) => {
+const verify = shopify.verify((c) => c.env.SHOPIFY_SECRET)
+
+defineWebhook({ method: 'POST', path: '/orders/:id', verify }, async ({ params }) => {
 	const order = await findOrder(params.id)
 	if (!order) throw new HTTPException(404, { message: 'Unknown order' })
 	// ...
@@ -400,6 +525,21 @@ summarizeEvent(event)
 - Missing values are `null`, never `undefined`.
 - Request headers are left out on purpose, because they carry signatures and
   credentials.
+
+The summary keeps the parsed body, the response and the query string.
+Webhook bodies are often customer data and query strings can carry tokens,
+so choose what to keep before storing it:
+
+```ts
+summarizeEvent(event, {
+	body: false, // body and response become null
+	query: false, // query becomes null
+	headers: ['x-github-delivery', 'svix-id'] // kept as `headers`, lower-case
+})
+```
+
+A delivery id header lets a stored call be matched to the provider's
+delivery log.
 - `ip` comes from headers the client can set, so only trust it behind a
   proxy that overwrites them.
 
@@ -511,11 +651,20 @@ export const resendEvents = defineWebhook(
 
 ### Twilio form posts
 
+Twilio signs the public URL it called, so pass it when the app runs behind a
+proxy:
+
 ```ts
-defineWebhook(
+import { twilio } from 'hono-webhooks/signatures'
+
+export const incomingSms = defineWebhook(
 	{
 		method: 'POST',
 		path: '/twilio/sms',
+		bodyType: 'form',
+		verify: twilio.verify((c) => c.env.TWILIO_AUTH_TOKEN, {
+			url: (c) => `${c.env.PUBLIC_URL}${new URL(c.req.url).pathname}`
+		}),
 		body: z.object({ From: z.string(), Body: z.string() })
 	},
 	({ c, body }) =>
@@ -523,7 +672,30 @@ defineWebhook(
 			'content-type': 'text/xml'
 		})
 )
+
+// In a test, sign the URL testWebhook sends to
+await testWebhook(incomingSms, {
+	body: { From: '+4512345678', Body: 'hi' },
+	sign: (raw, { url }) => twilio.sign(raw, 'token', { url })
+})
 ```
+
+Twilio answers a failed call with a spoken error unless it gets TwiML. Mount
+the Twilio webhooks with their own `createWebhooks` and an `onError` that
+returns TwiML with status 200.
+
+### Duplicate deliveries and slow handlers
+
+Providers retry: on a timeout, a 5xx, sometimes for no reason. Expect each
+delivery more than once.
+
+- Answer fast. Most providers give up after 5 to 30 seconds and send again.
+  Enqueue a job and return; do the work in the job.
+- Use the provider's delivery id (`svix-id`, Stripe's `event.id`,
+  `x-github-delivery`) as the job key or a unique column, so a retry finds
+  the first one.
+- To cap handler time, put `timeout()` from `hono/timeout` on the mount:
+  `app.use('/webhooks/*', timeout(10_000))`.
 
 ### Storing every call
 
@@ -534,7 +706,7 @@ createWebhooks(webhooks, {
 	logErrors: false, // errors are stored below instead
 	onEvent: async (e) => {
 		if (e.route === '/health') return
-		const call = summarizeEvent(e)
+		const call = summarizeEvent(e, { body: false, headers: ['x-github-delivery'] })
 		await db.insert(webhookCalls).values({
 			...call,
 			errorMessage: call.error?.message ?? null,
@@ -562,10 +734,14 @@ createWebhooks(webhooks, {
 		ignoreRoutes: ['/health'],
 		// one `webhook.completed` log per request, with the request's span
 		logger: (span) => createLogger({ span }),
+		// what `call` keeps, as for summarizeEvent
+		summary: { body: false },
 		onWebhookCall(call, event) {
-			// `call` is summarizeEvent(event) plus `level` and `outcome`;
-			// the request's span is active here
+			// `call` is summarizeEvent(event) plus `level`, `outcome` and
+			// `ignored`; the request's span is active here
+			if (call.ignored) return
 			storeCall(call)
+			if (call.status >= 500) captureException(event.error)
 		}
 	}),
 	// the completion log carries the error type
@@ -583,12 +759,15 @@ createWebhooks(webhooks, {
   `__unmatched__` for a 404) and `status` (`success` below 400, else `failed`).
 - **Log** `webhook.completed`, when `logger` is set, at `error` for 5xx,
   `warn` for 4xx and `info` otherwise, with `route`, `method`, `status_code`,
-  `duration_ms`, `status` (`success`, `failed` or `validation_failed`) and
-  `error_type`. `logger` gets the request's span and returns anything with
+  `duration_ms`, `status` (`success`, `failed` or `validation_failed`),
+  `error_type` and `error_message`. `logger` gets the request's span and returns anything with
   `info`, `warn` and `error` methods taking `(message, fields)`, so
   `logger: () => console` works. 404s and `ignoreRoutes` are not logged.
 - `ignoreRoutes` skips metrics and the log; the span and `onWebhookCall` still
-  run.
+  run, with `call.ignored: true`.
+- With `logErrors: false`, a handler error reaches the span and the log, not
+  the parent app's `onError`. Report it to an error tracker from
+  `onWebhookCall` (`event.error`).
 - `webhookMetrics` describes both metrics (`name`, `kind`, `unit`,
   `description` and `attributes`, where each attribute maps to its values or
   `'string'`), so a metric catalog can list them:
@@ -615,6 +794,9 @@ onEvent(e) {
 	log(e)
 }
 ```
+
+With `otelWebhooks`, use `ignoreRoutes` and check `call.ignored` in
+`onWebhookCall`.
 
 ### Organising webhooks in a project
 
@@ -651,7 +833,7 @@ describeWebhooks(webhooks)
 //   method: 'POST',
 //   path: '/orders/:id',
 //   description: 'Order paid',
-//   verified: true,          // has a verify function
+//   verified: true,          // has a verify function (false for verify: false)
 //   bodyType: 'auto',
 //   jsonSchema: { params: null, query: null, headers: null, body: {...}, response: {...} }
 // }]
@@ -693,7 +875,8 @@ test('marks the order paid', async () => {
 | `params`  | Filled into the path pattern. Use `path` instead for wildcard patterns.                                      |
 | `query`, `headers` | String records.                                                                                     |
 | `body`    | A string is sent as is. Anything else is sent as JSON, or url-encoded when `bodyType` is `'form'`.            |
-| `sign`    | Gets the exact raw body and returns headers to add, e.g. `(raw) => github.sign(raw, secret)`.                 |
+| `sign`    | Gets the exact raw body and `{ url, method }`, and returns headers to add, e.g. `(raw) => github.sign(raw, secret)` or `(raw, { url }) => twilio.sign(raw, token, { url })`. |
+| `baseUrl` | Origin the request goes to, default `http://localhost`. For schemes that sign the URL.                       |
 | `env`     | Bindings, available as `c.env`.                                                                              |
 | `options` | `createWebhooks` options, e.g. `{ onEvent }`.                                                                |
 
@@ -717,7 +900,7 @@ Options for test:
   -b, --body <text>         Request body (JSON sets content-type: application/json)
   -q, --query <params>      Query string, e.g. "a=1&b=2"
   -H, --header <k: v>       Request header, repeatable
-  -s, --sign <scheme>       Sign the body: github, shopify, stripe, svix
+  -s, --sign <scheme>       Sign the body: github, hubspot, infisical, meta, shopify, stripe, svix, twilio
   -e, --secret-env <name>   Environment variable holding the signing secret
 ```
 
@@ -743,7 +926,9 @@ bunx hono-webhooks ./src/webhooks/index.ts test POST /shopify/orders -b '{"id":1
   a file path or a package name.
 - `--sign` signs the exact `--body` with the secret read from the environment
   variable named by `--secret-env`, after preloading, so a preloaded module
-  can set it.
+  can set it. `twilio` and `hubspot` sign `http://localhost<path>`, the URL
+  the request is sent to. For `infisical`, put a current `timestamp`
+  (milliseconds) in the body. For a shared secret, send the header with `-H`.
 - `schema` prints the JSON Schemas from
   [`describeWebhooks`](#describing-webhooks).
 - The CLI imports your TypeScript file. `bunx hono-webhooks` starts the CLI
@@ -764,16 +949,31 @@ import {
 	WebhookValidationError, // extends HTTPException; .target, .issues
 	describeWebhooks, // (appOrArray, { target? }) => WebhookDescription[]
 	testWebhook, // (webhook, input?) => Promise<Response>
-	summarizeEvent, // (event) => WebhookEventSummary, flat and JSON-safe
-	formatIssues // (issues) => 'total: Expected number; ...'
+	summarizeEvent, // (event, options?) => WebhookEventSummary, flat and JSON-safe
+	formatIssues, // (issues) => 'total: Expected number; ...'
+	webhookPath // (webhook, params?) => '/channels/gmail/callback'
 } from 'hono-webhooks'
 
 import {
 	github,
+	meta,
 	shopify,
 	stripe,
-	svix, // each: .verify(secret, options?) and .sign(rawBody, secret, options?)
-	hmac // (options) => a scheme like the ones above
+	svix,
+	infisical,
+	twilio,
+	hubspot, // each: .verify(secret, options?) and .sign(rawBody, secret, options?)
+	hmac, // (options) => a scheme like the ones above
+	sharedSecret // ({ header, prefix? }) => a scheme comparing the secret itself
+} from 'hono-webhooks/signatures'
+
+import type {
+	Secret,
+	SignatureScheme,
+	HmacOptions,
+	SharedSecretOptions,
+	SignedUrl,
+	VerifyFailureReason
 } from 'hono-webhooks/signatures'
 
 import {
@@ -789,6 +989,7 @@ import type {
 	WebhookResult,
 	WebhookEvent,
 	WebhookEventSummary,
+	SummaryOptions,
 	WebhookDescription,
 	TestWebhookInput,
 	WebhooksOptions,
@@ -812,6 +1013,28 @@ import type {
 ```
 
 Use `Webhook` to type a list: `const all: Webhook<AppEnv>[] = [a, b]`.
+
+`webhookPath(webhook, params)` fills a webhook's path pattern, typed from the
+path, so an OAuth redirect or a provider subscription URL is built from the
+definition instead of typed twice. It is relative to the mount point; add
+your origin and prefix.
+
+## Upgrading to 0.6
+
+- **`verify` is required for every method but `GET`.** `createWebhooks`
+  throws at startup for a webhook without one. Add a `verify` function, or
+  `verify: false` to a webhook that is public on purpose. Move checks that
+  live in the handler (API keys, tokens, OAuth state) into `verify`.
+- **Bodies over 1 MiB answer 413.** Raise it with `maxBodyBytes` on
+  `createWebhooks` or on the webhook, or pass `Infinity` for the old
+  behavior.
+- **The 401 body is `{ error: 'Invalid signature' }`**, without `issues`.
+  The reason is on `event.validation`.
+- **`VerifyInput` has a `fail` function.** Code that calls a scheme's
+  `verify` by hand should pass `fail: () => false` (the built-in schemes
+  work without it).
+- **Only `true` passes.** A custom `verify` returning another truthy value
+  now answers 401.
 
 ## Upgrading from 0.1
 

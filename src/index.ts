@@ -3,6 +3,7 @@ import type {
 	StandardSchemaV1
 } from '@standard-schema/spec'
 import { type Context, type Env, Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { HTTPException } from 'hono/http-exception'
 import { basePath } from 'hono/route'
 import type { ParamKeys } from 'hono/types'
@@ -67,9 +68,18 @@ export interface VerifyInput<E extends Env = any> {
 	rawBody: string
 	/** All request headers, lower-case names, not schema-validated. */
 	headers: Record<string, string>
+	/**
+	 * Records why the check failed and returns `false`:
+	 * `return fail('timestamp-out-of-tolerance')`. The reason reaches
+	 * `onEvent` (`validation.issues[0].message`), never the response.
+	 */
+	fail(reason: string): false
 }
 
-/** Checks a request's signature. `hono-webhooks/signatures` has ready-made ones. */
+/**
+ * Checks a request's signature. `hono-webhooks/signatures` has ready-made
+ * ones. Only `true` lets the request through.
+ */
 export type Verify<E extends Env = any> = (
 	input: VerifyInput<E>
 ) => MaybePromise<boolean>
@@ -95,9 +105,14 @@ export interface WebhookConfig<
 	 * Checks the signature right after routing, before anything is validated
 	 * or parsed. Returning `false` answers `401 { error: 'Invalid signature' }`.
 	 *
+	 * Required for every method but `GET`: pass `false` for a webhook that is
+	 * public on purpose, or `createWebhooks` throws.
+	 *
 	 * @example verify: shopify.verify((c) => c.env.SHOPIFY_SECRET)
 	 */
-	verify?: Verify<E>
+	verify?: Verify<E> | false
+	/** Overrides `WebhooksOptions.maxBodyBytes` for this webhook. */
+	maxBodyBytes?: number
 	/**
 	 * Checks what the handler returns. A mismatch is reported on
 	 * `WebhookEvent.validation` and the response is still sent.
@@ -225,7 +240,15 @@ export interface WebhooksOptions<E extends Env = any> {
 	 * @default true
 	 */
 	logErrors?: boolean
+	/**
+	 * Larger bodies answer `413 { error: 'Payload too large' }` before they
+	 * are read. `Infinity` turns the limit off. Each webhook can override it.
+	 * @default 1_048_576 (1 MiB)
+	 */
+	maxBodyBytes?: number
 }
+
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024
 
 export type WebhooksApp<E extends Env = any> = Hono<E> & {
 	/** The definitions, in the order they were passed. */
@@ -298,7 +321,10 @@ async function parse(
 
 function defaultErrorResponse(error: unknown, c: Context, log: boolean) {
 	if (error instanceof WebhookValidationError) {
-		return c.json({ error: error.message, issues: error.issues }, error.status)
+		// Why a signature failed is for the operator (onEvent), not the caller.
+		return error.target === 'signature'
+			? c.json({ error: error.message }, error.status)
+			: c.json({ error: error.message, issues: error.issues }, error.status)
 	}
 	if (error instanceof HTTPException) {
 		return error.res ?? c.json({ error: error.message }, error.status)
@@ -332,6 +358,11 @@ function makeCreateWebhooks<E extends Env>() {
 		const methodsByPath = new Map<string, WebhookMethod[]>()
 
 		for (const { config } of webhooks) {
+			if (config.method !== 'GET' && config.verify === undefined) {
+				throw new Error(
+					`hono-webhooks: ${config.method} ${config.path} has no verify. Pass a verify function, or verify: false if it is public on purpose.`
+				)
+			}
 			const methods = methodsByPath.get(config.path) ?? []
 			if (methods.includes(config.method)) {
 				throw new Error(
@@ -392,20 +423,37 @@ function makeCreateWebhooks<E extends Env>() {
 				config.method,
 				config.path,
 				handle(config.path, async (c, event) => {
+					const maxSize =
+						config.maxBodyBytes ??
+						options.maxBodyBytes ??
+						DEFAULT_MAX_BODY_BYTES
+					if (maxSize !== Infinity) {
+						await bodyLimit({
+							maxSize,
+							onError: () => {
+								throw new HTTPException(413, { message: 'Payload too large' })
+							}
+						})(c, async () => {})
+					}
 					// The signature is checked first, so unauthenticated callers only
 					// ever see 401, never a description of the schemas.
 					event.rawBody = await c.req.text()
-					if (
-						config.verify &&
-						!(await config.verify({
+					if (config.verify) {
+						let reason = 'Signature does not match'
+						const ok = await config.verify({
 							c,
 							rawBody: event.rawBody,
-							headers: c.req.header()
-						}))
-					) {
-						throw new WebhookValidationError('signature', [
-							{ message: 'Signature does not match' }
-						])
+							headers: c.req.header(),
+							fail: (why) => {
+								reason = why
+								return false
+							}
+						})
+						if (ok !== true) {
+							throw new WebhookValidationError('signature', [
+								{ message: reason }
+							])
+						}
 					}
 					type Parts = Record<string, unknown>
 					event.params = (await parse(
@@ -492,7 +540,12 @@ function makeCreateWebhooks<E extends Env>() {
  *
  * @example
  * defineWebhook(
- *   { method: 'POST', path: '/orders/:id', body: z.object({ total: z.number() }) },
+ *   {
+ *     method: 'POST',
+ *     path: '/orders/:id',
+ *     verify: shopify.verify((c) => c.env.SHOPIFY_SECRET),
+ *     body: z.object({ total: z.number() })
+ *   },
  *   async ({ params, body }) => ({ id: params.id, total: body.total })
  * )
  */
@@ -501,7 +554,8 @@ export const defineWebhook = makeDefineWebhook<any>()
 /**
  * Builds a Hono app that serves the webhooks. Mount it under a prefix:
  * `app.route('/webhooks', createWebhooks([...]))`. Unknown paths below the
- * prefix answer 404, known paths with the wrong method answer 405.
+ * prefix answer 404, known paths with the wrong method answer 405. Throws
+ * for a duplicate route and for a non-GET webhook without `verify`.
  */
 export const createWebhooks = makeCreateWebhooks<any>()
 
@@ -555,6 +609,8 @@ export interface WebhookEventSummary {
 	userAgent: string | null
 	params: Record<string, unknown> | null
 	query: Record<string, unknown> | null
+	/** Only the headers named in `SummaryOptions.headers`; absent without that option. */
+	headers?: Record<string, string>
 	body: unknown
 	response: unknown
 	/** `null` for validation failures, which `validation` describes. */
@@ -567,15 +623,37 @@ export interface WebhookEventSummary {
 	} | null
 }
 
+/** What `summarizeEvent` keeps. Defaults keep everything but headers. */
+export interface SummaryOptions {
+	/** `false` sets `body` and `response` to `null`. @default true */
+	body?: boolean
+	/** `false` sets `query` to `null`. @default true */
+	query?: boolean
+	/**
+	 * Request headers to keep, lower-case, e.g. a delivery id such as
+	 * `x-github-delivery` or `svix-id`. @default []
+	 */
+	headers?: readonly string[]
+}
+
 /**
- * Flattens an event for logging or storage. Request headers are left out on
- * purpose: they carry signatures and credentials.
+ * Flattens an event for logging or storage. Request headers are left out
+ * unless named in `options.headers`: they carry signatures and credentials.
  *
  * @example
- * onEvent: (e) => db.insert(webhookCalls).values(summarizeEvent(e))
+ * onEvent: (e) => db.insert(webhookCalls).values(summarizeEvent(e, { body: false }))
  */
-export function summarizeEvent(event: WebhookEvent): WebhookEventSummary {
+export function summarizeEvent(
+	event: WebhookEvent,
+	options: SummaryOptions = {}
+): WebhookEventSummary {
 	const { c, error, validation } = event
+	const keepBody = options.body ?? true
+	const headers: Record<string, string> = {}
+	for (const name of options.headers ?? []) {
+		const value = c.req.header(name)
+		if (value !== undefined) headers[name] = value
+	}
 	return {
 		route: event.route ?? null,
 		method: event.method,
@@ -589,9 +667,10 @@ export function summarizeEvent(event: WebhookEvent): WebhookEventSummary {
 			null,
 		userAgent: c.req.header('user-agent') ?? null,
 		params: event.params ?? null,
-		query: event.query ?? null,
-		body: event.body ?? null,
-		response: event.response ?? null,
+		query: options.query === false ? null : (event.query ?? null),
+		...(options.headers && { headers }),
+		body: keepBody ? (event.body ?? null) : null,
+		response: keepBody ? (event.response ?? null) : null,
 		// A validation failure is described by `validation`; its error adds only
 		// a library stack trace.
 		error:
@@ -621,7 +700,7 @@ export interface WebhookDescription {
 	method: WebhookMethod
 	path: string
 	description: string | null
-	/** Whether the webhook has a `verify` function. */
+	/** Whether the webhook has a `verify` function; `false` for `verify: false`. */
 	verified: boolean
 	bodyType: BodyType
 	/**
@@ -695,8 +774,20 @@ export type TestWebhookInput<W> =
 				 * webhook's `bodyType` is `'form'`.
 				 */
 				body?: In<TBody, unknown> | string
-				/** Headers computed from the raw body, e.g. `(raw) => shopify.sign(raw, secret)`. */
-				sign?: (rawBody: string) => MaybePromise<Record<string, string>>
+				/**
+				 * Headers computed from the raw body and the request, e.g.
+				 * `(raw) => shopify.sign(raw, secret)` or
+				 * `(raw, { url }) => twilio.sign(raw, token, { url })`.
+				 */
+				sign?: (
+					rawBody: string,
+					request: { url: string; method: string }
+				) => MaybePromise<Record<string, string>>
+				/**
+				 * Origin the request is sent to, for schemes that sign the URL.
+				 * @default 'http://localhost'
+				 */
+				baseUrl?: string
 				/** Bindings, available as `c.env`. */
 				env?: E extends { Bindings: infer B } ? B : unknown
 				/** `onEvent`, `onError` and so on, as for `createWebhooks`. */
@@ -726,7 +817,13 @@ export async function testWebhook<W extends Webhook>(
 	input: TestWebhookInput<W> = {} as TestWebhookInput<W>
 ): Promise<Response> {
 	const { config } = webhook
-	const { body, sign, env, options } = input as TestWebhookInput<Webhook>
+	const {
+		body,
+		sign,
+		env,
+		options,
+		baseUrl = 'http://localhost'
+	} = input as TestWebhookInput<Webhook>
 	const headers = new Headers(input.headers)
 	let rawBody: string | undefined
 	if (typeof body === 'string') {
@@ -743,18 +840,31 @@ export async function testWebhook<W extends Webhook>(
 			headers.set('content-type', 'application/json')
 		}
 	}
-	for (const [name, value] of Object.entries(
-		(await sign?.(rawBody ?? '')) ?? {}
-	)) {
-		headers.set(name, value)
-	}
 	const path =
 		input.path ??
 		fillPath(config.path, (input.params ?? {}) as Record<string, unknown>)
 	const query = new URLSearchParams(input.query).toString()
+	const url = `${baseUrl.replace(/\/$/, '')}${path || '/'}${query ? `?${query}` : ''}`
+	for (const [name, value] of Object.entries(
+		(await sign?.(rawBody ?? '', { url, method: config.method })) ?? {}
+	)) {
+		headers.set(name, value)
+	}
 	return createWebhooks([webhook], options).request(
-		`${path || '/'}${query ? `?${query}` : ''}`,
+		url,
 		{ method: config.method, headers, body: rawBody },
 		env as object | undefined
 	)
+}
+
+/**
+ * The webhook's path with `params` filled in, relative to the mount point:
+ * `webhookPath(oauthCallback, { provider: 'gmail' })` gives
+ * `/channels/gmail/callback`. Prepend your origin and mount prefix for a URL.
+ */
+export function webhookPath<P extends string>(
+	webhook: Webhook<any, P>,
+	...[params]: [ParamKeys<P>] extends [never] ? [] : [PathParams<P>]
+): string {
+	return fillPath(webhook.config.path, params ?? {}) || '/'
 }
